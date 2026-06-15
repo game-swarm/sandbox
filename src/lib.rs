@@ -7,6 +7,15 @@ use wasmtime::{
     StoreLimits, StoreLimitsBuilder, TypedFunc,
 };
 
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+use std::io::{Read, Write};
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+use std::os::unix::process::CommandExt;
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+use std::process::{Command, Stdio};
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+use std::time::{Duration, Instant};
+
 pub const MAX_MODULE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_OUTPUT_JSON_BYTES: usize = 256 * 1024;
 pub const MAX_WASM_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -16,8 +25,15 @@ pub const DEFAULT_EPOCH_DEADLINE_TICKS: u64 = 1;
 pub const DEFAULT_HOST_CALLS_PER_TICK: u32 = 1_000;
 pub const DEFAULT_PATH_FIND_PER_TICK: u32 = 10;
 pub const DEFAULT_OBJECTS_IN_RANGE_PER_TICK: u32 = 5;
+pub const DEFAULT_TICK_TIMEOUT_MS: u64 = 2_500;
 
 const RESULT_STRUCT_BYTES: i32 = 8;
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+const CHILD_ENV: &str = "SWARM_WASM_SANDBOX_CHILD";
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+const PROTOCOL_MAGIC: u32 = 0x5357_5342;
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+const PROTOCOL_VERSION: u32 = 1;
 const ALLOWED_IMPORTS: &[(&str, &str)] = &[
     ("env", "host_get_terrain"),
     ("env", "host_get_objects_in_range"),
@@ -34,6 +50,38 @@ pub struct SandboxConfig {
     pub max_path_find_per_tick: u32,
     pub max_objects_in_range_per_tick: u32,
     pub max_output_json_bytes: usize,
+    pub tick_timeout_ms: u64,
+    pub isolation: IsolationMode,
+    pub os_isolation: OsIsolationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationMode {
+    InProcess,
+    OsProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OsIsolationPolicy {
+    pub seccomp: bool,
+    pub cgroup: bool,
+    pub network_namespace: bool,
+    pub read_only_root: bool,
+    pub tmpfs_tmp: bool,
+    pub allow_permission_fallback: bool,
+}
+
+impl Default for OsIsolationPolicy {
+    fn default() -> Self {
+        Self {
+            seccomp: false,
+            cgroup: false,
+            network_namespace: false,
+            read_only_root: false,
+            tmpfs_tmp: false,
+            allow_permission_fallback: true,
+        }
+    }
 }
 
 impl Default for SandboxConfig {
@@ -45,6 +93,9 @@ impl Default for SandboxConfig {
             max_path_find_per_tick: DEFAULT_PATH_FIND_PER_TICK,
             max_objects_in_range_per_tick: DEFAULT_OBJECTS_IN_RANGE_PER_TICK,
             max_output_json_bytes: MAX_OUTPUT_JSON_BYTES,
+            tick_timeout_ms: DEFAULT_TICK_TIMEOUT_MS,
+            isolation: IsolationMode::InProcess,
+            os_isolation: OsIsolationPolicy::default(),
         }
     }
 }
@@ -103,6 +154,16 @@ pub enum SandboxError {
     OutputTooLarge { actual: usize },
     #[error("host call budget exceeded")]
     HostCallBudgetExceeded,
+    #[error("OS process isolation is unavailable on this build/target")]
+    OsIsolationUnavailable,
+    #[error("OS process isolation I/O error: {0}")]
+    OsIsolationIo(String),
+    #[error("OS process isolation protocol error: {0}")]
+    OsIsolationProtocol(String),
+    #[error("OS process isolation child failed: {0}")]
+    OsIsolationChildFailed(String),
+    #[error("OS process isolation timed out after {timeout_ms}ms")]
+    OsIsolationTimedOut { timeout_ms: u64 },
 }
 
 #[derive(Clone)]
@@ -114,6 +175,11 @@ pub struct SandboxRuntime {
 #[derive(Clone)]
 pub struct CompiledModule {
     module: Module,
+    #[cfg_attr(
+        not(all(feature = "os-isolation", target_os = "linux")),
+        allow(dead_code)
+    )]
+    wasm_bytes: Vec<u8>,
 }
 
 struct StoreState {
@@ -150,10 +216,24 @@ impl SandboxRuntime {
         let module = Module::from_binary(&self.engine, wasm_bytes)?;
         validate_module_exports(&module)?;
         validate_module_imports(&module)?;
-        Ok(CompiledModule { module })
+        Ok(CompiledModule {
+            module,
+            wasm_bytes: wasm_bytes.to_vec(),
+        })
     }
 
     pub fn execute_tick(
+        &self,
+        compiled: &CompiledModule,
+        snapshot_json: &[u8],
+    ) -> Result<TickOutput, SandboxError> {
+        match self.config.isolation {
+            IsolationMode::InProcess => self.execute_tick_in_process(compiled, snapshot_json),
+            IsolationMode::OsProcess => self.execute_tick_os_process(compiled, snapshot_json),
+        }
+    }
+
+    fn execute_tick_in_process(
         &self,
         compiled: &CompiledModule,
         snapshot_json: &[u8],
@@ -233,6 +313,24 @@ impl SandboxRuntime {
             command_json,
             host_call_budget: store.data().host_budget.clone(),
         })
+    }
+
+    #[cfg(all(feature = "os-isolation", target_os = "linux"))]
+    fn execute_tick_os_process(
+        &self,
+        compiled: &CompiledModule,
+        snapshot_json: &[u8],
+    ) -> Result<TickOutput, SandboxError> {
+        linux_os_isolation::execute_tick(self.config.clone(), &compiled.wasm_bytes, snapshot_json)
+    }
+
+    #[cfg(not(all(feature = "os-isolation", target_os = "linux")))]
+    fn execute_tick_os_process(
+        &self,
+        _compiled: &CompiledModule,
+        _snapshot_json: &[u8],
+    ) -> Result<TickOutput, SandboxError> {
+        Err(SandboxError::OsIsolationUnavailable)
     }
 
     pub fn increment_epoch(&self) {
@@ -492,6 +590,676 @@ fn usize_to_i32(value: usize) -> Result<i32, SandboxError> {
     i32::try_from(value).map_err(|_| SandboxError::PointerOverflow)
 }
 
+#[cfg(all(feature = "os-isolation", target_os = "linux"))]
+mod linux_os_isolation {
+    use super::*;
+
+    #[ctor::ctor]
+    fn maybe_run_child_worker() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+
+        let code = match child_main() {
+            Ok(()) => 0,
+            Err(err) => {
+                let _ = write_error_response(&err.to_string());
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
+    pub(super) fn execute_tick(
+        config: SandboxConfig,
+        wasm_bytes: &[u8],
+        snapshot_json: &[u8],
+    ) -> Result<TickOutput, SandboxError> {
+        let current_exe =
+            std::env::current_exe().map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?;
+        let mut child = unsafe {
+            let mut command = Command::new(current_exe);
+            command
+                .env(CHILD_ENV, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            command
+                .spawn()
+                .map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?
+        };
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| SandboxError::OsIsolationIo("child stdin unavailable".into()))?;
+        write_request(&mut stdin, &config, wasm_bytes, snapshot_json)?;
+        drop(stdin);
+
+        let deadline = Instant::now() + Duration::from_millis(config.tick_timeout_ms);
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?
+            {
+                let mut stdout = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    out.read_to_end(&mut stdout)
+                        .map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?;
+                }
+                let mut stderr = String::new();
+                if let Some(mut err_pipe) = child.stderr.take() {
+                    let _ = err_pipe.read_to_string(&mut stderr);
+                }
+
+                let response = read_response(&stdout)?;
+                return match response {
+                    ChildResponse::Ok(output) => Ok(output),
+                    ChildResponse::Err(message) => {
+                        let detail = if stderr.trim().is_empty() {
+                            message
+                        } else {
+                            format!("{message}; stderr: {}", stderr.trim())
+                        };
+                        if status.success() {
+                            Err(SandboxError::OsIsolationChildFailed(detail))
+                        } else {
+                            Err(SandboxError::OsIsolationChildFailed(format!(
+                                "{detail}; exit status: {status}"
+                            )))
+                        }
+                    }
+                };
+            }
+
+            if Instant::now() >= deadline {
+                kill_process_group(child.id());
+                let _ = child.wait();
+                return Err(SandboxError::OsIsolationTimedOut {
+                    timeout_ms: config.tick_timeout_ms,
+                });
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn child_main() -> Result<(), SandboxError> {
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?;
+        let (mut config, wasm_bytes, snapshot_json) = parse_request(&input)?;
+        config.isolation = IsolationMode::InProcess;
+        apply_policy(config.os_isolation)?;
+
+        let runtime = SandboxRuntime::new(config)?;
+        let module = runtime.compile(&wasm_bytes)?;
+        let output = runtime.execute_tick_in_process(&module, &snapshot_json)?;
+        write_ok_response(&output)
+    }
+
+    enum ChildResponse {
+        Ok(TickOutput),
+        Err(String),
+    }
+
+    fn write_request(
+        writer: &mut impl Write,
+        config: &SandboxConfig,
+        wasm_bytes: &[u8],
+        snapshot_json: &[u8],
+    ) -> Result<(), SandboxError> {
+        writer.write_all(&PROTOCOL_MAGIC.to_le_bytes())?;
+        writer.write_all(&PROTOCOL_VERSION.to_le_bytes())?;
+        write_config(writer, config)?;
+        write_bytes(writer, wasm_bytes)?;
+        write_bytes(writer, snapshot_json)?;
+        Ok(())
+    }
+
+    fn parse_request(input: &[u8]) -> Result<(SandboxConfig, Vec<u8>, Vec<u8>), SandboxError> {
+        let mut cursor = Cursor::new(input);
+        let magic = cursor.u32()?;
+        if magic != PROTOCOL_MAGIC {
+            return Err(SandboxError::OsIsolationProtocol("bad magic".into()));
+        }
+        let version = cursor.u32()?;
+        if version != PROTOCOL_VERSION {
+            return Err(SandboxError::OsIsolationProtocol(format!(
+                "unsupported protocol version {version}"
+            )));
+        }
+        let config = read_config(&mut cursor)?;
+        let wasm_bytes = cursor.bytes()?;
+        let snapshot_json = cursor.bytes()?;
+        if cursor.remaining() != 0 {
+            return Err(SandboxError::OsIsolationProtocol("trailing bytes".into()));
+        }
+        Ok((config, wasm_bytes, snapshot_json))
+    }
+
+    fn write_config(writer: &mut impl Write, config: &SandboxConfig) -> Result<(), SandboxError> {
+        writer.write_all(&config.max_fuel.to_le_bytes())?;
+        writer.write_all(&config.epoch_deadline_ticks.to_le_bytes())?;
+        writer.write_all(&config.max_host_calls_per_tick.to_le_bytes())?;
+        writer.write_all(&config.max_path_find_per_tick.to_le_bytes())?;
+        writer.write_all(&config.max_objects_in_range_per_tick.to_le_bytes())?;
+        writer.write_all(&(config.max_output_json_bytes as u64).to_le_bytes())?;
+        writer.write_all(&config.tick_timeout_ms.to_le_bytes())?;
+        writer.write_all(&[config.os_isolation.seccomp as u8])?;
+        writer.write_all(&[config.os_isolation.cgroup as u8])?;
+        writer.write_all(&[config.os_isolation.network_namespace as u8])?;
+        writer.write_all(&[config.os_isolation.read_only_root as u8])?;
+        writer.write_all(&[config.os_isolation.tmpfs_tmp as u8])?;
+        writer.write_all(&[config.os_isolation.allow_permission_fallback as u8])?;
+        Ok(())
+    }
+
+    fn read_config(cursor: &mut Cursor<'_>) -> Result<SandboxConfig, SandboxError> {
+        Ok(SandboxConfig {
+            max_fuel: cursor.u64()?,
+            epoch_deadline_ticks: cursor.u64()?,
+            max_host_calls_per_tick: cursor.u32()?,
+            max_path_find_per_tick: cursor.u32()?,
+            max_objects_in_range_per_tick: cursor.u32()?,
+            max_output_json_bytes: cursor.u64()? as usize,
+            tick_timeout_ms: cursor.u64()?,
+            isolation: IsolationMode::InProcess,
+            os_isolation: OsIsolationPolicy {
+                seccomp: cursor.bool()?,
+                cgroup: cursor.bool()?,
+                network_namespace: cursor.bool()?,
+                read_only_root: cursor.bool()?,
+                tmpfs_tmp: cursor.bool()?,
+                allow_permission_fallback: cursor.bool()?,
+            },
+        })
+    }
+
+    fn write_ok_response(output: &TickOutput) -> Result<(), SandboxError> {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&PROTOCOL_MAGIC.to_le_bytes())?;
+        stdout.write_all(&PROTOCOL_VERSION.to_le_bytes())?;
+        stdout.write_all(&[0])?;
+        stdout.write_all(&output.host_call_budget.total_calls.to_le_bytes())?;
+        stdout.write_all(&output.host_call_budget.path_find_calls.to_le_bytes())?;
+        stdout.write_all(&output.host_call_budget.objects_in_range_calls.to_le_bytes())?;
+        write_bytes(&mut stdout, &output.command_json)?;
+        Ok(())
+    }
+
+    fn write_error_response(message: &str) -> Result<(), SandboxError> {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&PROTOCOL_MAGIC.to_le_bytes())?;
+        stdout.write_all(&PROTOCOL_VERSION.to_le_bytes())?;
+        stdout.write_all(&[1])?;
+        write_bytes(&mut stdout, message.as_bytes())?;
+        Ok(())
+    }
+
+    fn read_response(input: &[u8]) -> Result<ChildResponse, SandboxError> {
+        let mut cursor = Cursor::new(input);
+        let magic = cursor.u32()?;
+        if magic != PROTOCOL_MAGIC {
+            return Err(SandboxError::OsIsolationProtocol(
+                "bad response magic".into(),
+            ));
+        }
+        let version = cursor.u32()?;
+        if version != PROTOCOL_VERSION {
+            return Err(SandboxError::OsIsolationProtocol(format!(
+                "unsupported response version {version}"
+            )));
+        }
+        match cursor.u8()? {
+            0 => {
+                let host_call_budget = HostCallBudget {
+                    total_calls: cursor.u32()?,
+                    path_find_calls: cursor.u32()?,
+                    objects_in_range_calls: cursor.u32()?,
+                };
+                let command_json = cursor.bytes()?;
+                Ok(ChildResponse::Ok(TickOutput {
+                    command_json,
+                    host_call_budget,
+                }))
+            }
+            1 => Ok(ChildResponse::Err(
+                String::from_utf8(cursor.bytes()?).unwrap_or_else(|err| err.to_string()),
+            )),
+            tag => Err(SandboxError::OsIsolationProtocol(format!(
+                "unknown response tag {tag}"
+            ))),
+        }
+    }
+
+    fn write_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), SandboxError> {
+        let len = u64::try_from(bytes.len()).map_err(|_| SandboxError::PointerOverflow)?;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(bytes)?;
+        Ok(())
+    }
+
+    fn apply_policy(_policy: OsIsolationPolicy) -> Result<(), SandboxError> {
+        #[cfg(feature = "os-network-namespace")]
+        if _policy.network_namespace {
+            allow_permission_failure(
+                unsafe { libc::unshare(libc::CLONE_NEWNET) },
+                "unshare(CLONE_NEWNET)",
+                _policy.allow_permission_fallback,
+            )?;
+        }
+
+        #[cfg(feature = "os-readonly-root")]
+        if _policy.read_only_root {
+            allow_permission_failure(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                "unshare(CLONE_NEWNS)",
+                _policy.allow_permission_fallback,
+            )?;
+            allow_permission_failure(
+                unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        (libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+                        std::ptr::null(),
+                    )
+                },
+                "mount(/, MS_REMOUNT|MS_RDONLY)",
+                _policy.allow_permission_fallback,
+            )?;
+        }
+
+        #[cfg(feature = "os-tmpfs")]
+        if _policy.tmpfs_tmp {
+            allow_permission_failure(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                "unshare(CLONE_NEWNS)",
+                _policy.allow_permission_fallback,
+            )?;
+            allow_permission_failure(
+                unsafe {
+                    libc::mount(
+                        c"tmpfs".as_ptr(),
+                        c"/tmp".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+                        c"size=16m,mode=1777".as_ptr().cast(),
+                    )
+                },
+                "mount(tmpfs, /tmp)",
+                _policy.allow_permission_fallback,
+            )?;
+        }
+
+        #[cfg(feature = "os-seccomp")]
+        if _policy.seccomp {
+            apply_seccomp_policy(_policy.allow_permission_fallback)?;
+        }
+
+        #[cfg(feature = "os-cgroup")]
+        if _policy.cgroup {
+            apply_cgroup_policy(_policy.allow_permission_fallback)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "os-seccomp")]
+    fn apply_seccomp_policy(allow_fallback: bool) -> Result<(), SandboxError> {
+        allow_permission_failure(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            "prctl(PR_SET_NO_NEW_PRIVS)",
+            allow_fallback,
+        )?;
+
+        let Some(mut filters) = seccomp_filters_for_current_arch() else {
+            if allow_fallback {
+                return Ok(());
+            }
+            return Err(SandboxError::OsIsolationIo(
+                "seccomp syscall allowlist is unavailable for this architecture".into(),
+            ));
+        };
+        let mut program = libc::sock_fprog {
+            len: filters
+                .len()
+                .try_into()
+                .map_err(|_| SandboxError::PointerOverflow)?,
+            filter: filters.as_mut_ptr(),
+        };
+        allow_permission_failure(
+            unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &mut program as *mut libc::sock_fprog,
+                    0,
+                    0,
+                )
+            },
+            "prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)",
+            allow_fallback,
+        )
+    }
+
+    #[cfg(all(feature = "os-seccomp", target_arch = "x86_64"))]
+    fn seccomp_filters_for_current_arch() -> Option<Vec<libc::sock_filter>> {
+        const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+        Some(build_seccomp_allowlist(
+            AUDIT_ARCH_X86_64,
+            &[
+                libc::SYS_arch_prctl,
+                libc::SYS_brk,
+                libc::SYS_clock_gettime,
+                libc::SYS_clone,
+                libc::SYS_clone3,
+                libc::SYS_close,
+                libc::SYS_epoll_create1,
+                libc::SYS_epoll_ctl,
+                libc::SYS_epoll_pwait,
+                libc::SYS_eventfd2,
+                libc::SYS_exit,
+                libc::SYS_exit_group,
+                libc::SYS_fcntl,
+                libc::SYS_fstat,
+                libc::SYS_futex,
+                libc::SYS_getcwd,
+                libc::SYS_getdents64,
+                libc::SYS_getpid,
+                libc::SYS_getrandom,
+                libc::SYS_gettid,
+                libc::SYS_madvise,
+                libc::SYS_mmap,
+                libc::SYS_mprotect,
+                libc::SYS_mremap,
+                libc::SYS_munmap,
+                libc::SYS_nanosleep,
+                libc::SYS_newfstatat,
+                libc::SYS_openat,
+                libc::SYS_prctl,
+                libc::SYS_read,
+                libc::SYS_readlink,
+                libc::SYS_rseq,
+                libc::SYS_rt_sigaction,
+                libc::SYS_rt_sigprocmask,
+                libc::SYS_rt_sigreturn,
+                libc::SYS_sched_getaffinity,
+                libc::SYS_sched_yield,
+                libc::SYS_set_robust_list,
+                libc::SYS_set_tid_address,
+                libc::SYS_sigaltstack,
+                libc::SYS_statx,
+                libc::SYS_write,
+            ],
+        ))
+    }
+
+    #[cfg(all(feature = "os-seccomp", not(target_arch = "x86_64")))]
+    fn seccomp_filters_for_current_arch() -> Option<Vec<libc::sock_filter>> {
+        None
+    }
+
+    #[cfg(feature = "os-seccomp")]
+    pub(super) fn build_seccomp_allowlist(
+        arch: u32,
+        syscalls: &[libc::c_long],
+    ) -> Vec<libc::sock_filter> {
+        const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        const BPF_JMP_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+        const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+        const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+
+        let mut filters = Vec::with_capacity(syscalls.len() * 2 + 5);
+        filters.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET));
+        filters.push(bpf_jump(BPF_JMP_JEQ_K, arch, 1, 0));
+        filters.push(bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+        filters.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET));
+        for &syscall in syscalls {
+            filters.push(bpf_jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+            filters.push(bpf_stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        }
+        filters.push(bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+        filters
+    }
+
+    #[cfg(feature = "os-seccomp")]
+    fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+
+    #[cfg(feature = "os-seccomp")]
+    fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        libc::sock_filter { code, jt, jf, k }
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    fn apply_cgroup_policy(allow_fallback: bool) -> Result<(), SandboxError> {
+        let root = match writable_cgroup_root() {
+            Ok(root) => root,
+            Err(err) if allow_fallback && err.is_permission_fallback => return Ok(()),
+            Err(err) => return Err(SandboxError::OsIsolationIo(err.message)),
+        };
+        let child = root.join(format!("swarm-wasm-sandbox-{}", std::process::id()));
+        create_cgroup_dir(&child, allow_fallback)?;
+        write_cgroup_file(&child.join("memory.max"), "134217728", allow_fallback)?;
+        write_cgroup_file(&child.join("memory.swap.max"), "0", allow_fallback)?;
+        write_cgroup_file(&child.join("cpu.max"), "250000 3000000", allow_fallback)?;
+        write_cgroup_file(&child.join("pids.max"), "32", allow_fallback)?;
+        write_cgroup_file(
+            &child.join("cgroup.procs"),
+            &std::process::id().to_string(),
+            allow_fallback,
+        )
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    fn writable_cgroup_root() -> Result<std::path::PathBuf, CgroupRootError> {
+        let roots = std::env::var_os("SWARM_WASM_SANDBOX_CGROUP_ROOT")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .chain(std::iter::once(std::path::PathBuf::from("/sys/fs/cgroup")));
+        let mut fallback_err = None;
+        for path in roots {
+            if !path.is_dir() {
+                continue;
+            }
+            match is_writable_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(err) if is_cgroup_permission_fallback(&err) => fallback_err = Some(err),
+                Err(err) => {
+                    return Err(CgroupRootError {
+                        message: format!("probe cgroup root {}: {err}", path.display()),
+                        is_permission_fallback: false,
+                    })
+                }
+            }
+        }
+        Err(CgroupRootError {
+            is_permission_fallback: fallback_err.is_some(),
+            message: match fallback_err {
+                Some(err) => format!("no writable cgroup v2 root found: {err}"),
+                None => "no writable cgroup v2 root found".into(),
+            },
+        })
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    struct CgroupRootError {
+        message: String,
+        is_permission_fallback: bool,
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    fn is_writable_dir(path: &std::path::Path) -> Result<(), std::io::Error> {
+        let probe = path.join(format!(
+            ".swarm-wasm-sandbox-write-test-{}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(probe);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    fn create_cgroup_dir(path: &std::path::Path, allow_fallback: bool) -> Result<(), SandboxError> {
+        match std::fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => handle_cgroup_io_error(err, "create cgroup", allow_fallback),
+        }
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    fn write_cgroup_file(
+        path: &std::path::Path,
+        value: &str,
+        allow_fallback: bool,
+    ) -> Result<(), SandboxError> {
+        std::fs::write(path, value)
+            .map_err(|err| (err, path.display().to_string()))
+            .or_else(|(err, path)| handle_cgroup_io_error(err, &path, allow_fallback))
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    fn handle_cgroup_io_error(
+        err: std::io::Error,
+        operation: &str,
+        allow_fallback: bool,
+    ) -> Result<(), SandboxError> {
+        if allow_fallback && is_cgroup_permission_fallback(&err) {
+            return Ok(());
+        }
+        Err(SandboxError::OsIsolationIo(format!("{operation}: {err}")))
+    }
+
+    #[cfg(feature = "os-cgroup")]
+    pub(super) fn is_cgroup_permission_fallback(err: &std::io::Error) -> bool {
+        matches!(err.raw_os_error(), Some(libc::EPERM | libc::EROFS))
+    }
+
+    #[cfg(any(
+        feature = "os-network-namespace",
+        feature = "os-readonly-root",
+        feature = "os-seccomp",
+        feature = "os-tmpfs"
+    ))]
+    fn allow_permission_failure(
+        result: libc::c_int,
+        operation: &'static str,
+        allow_fallback: bool,
+    ) -> Result<(), SandboxError> {
+        if result == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if allow_fallback && matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+            return Ok(());
+        }
+        Err(SandboxError::OsIsolationIo(format!("{operation}: {err}")))
+    }
+
+    fn kill_process_group(pid: u32) {
+        if let Ok(pid) = i32::try_from(pid) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    struct Cursor<'a> {
+        input: &'a [u8],
+        offset: usize,
+    }
+
+    impl<'a> Cursor<'a> {
+        fn new(input: &'a [u8]) -> Self {
+            Self { input, offset: 0 }
+        }
+
+        fn remaining(&self) -> usize {
+            self.input.len().saturating_sub(self.offset)
+        }
+
+        fn take(&mut self, len: usize) -> Result<&'a [u8], SandboxError> {
+            let end = self
+                .offset
+                .checked_add(len)
+                .ok_or(SandboxError::PointerOverflow)?;
+            if end > self.input.len() {
+                return Err(SandboxError::OsIsolationProtocol(
+                    "truncated message".into(),
+                ));
+            }
+            let bytes = &self.input[self.offset..end];
+            self.offset = end;
+            Ok(bytes)
+        }
+
+        fn u8(&mut self) -> Result<u8, SandboxError> {
+            Ok(self.take(1)?[0])
+        }
+
+        fn bool(&mut self) -> Result<bool, SandboxError> {
+            match self.u8()? {
+                0 => Ok(false),
+                1 => Ok(true),
+                value => Err(SandboxError::OsIsolationProtocol(format!(
+                    "invalid bool {value}"
+                ))),
+            }
+        }
+
+        fn u32(&mut self) -> Result<u32, SandboxError> {
+            Ok(u32::from_le_bytes(
+                self.take(4)?.try_into().expect("slice length"),
+            ))
+        }
+
+        fn u64(&mut self) -> Result<u64, SandboxError> {
+            Ok(u64::from_le_bytes(
+                self.take(8)?.try_into().expect("slice length"),
+            ))
+        }
+
+        fn bytes(&mut self) -> Result<Vec<u8>, SandboxError> {
+            let len = usize::try_from(self.u64()?).map_err(|_| SandboxError::PointerOverflow)?;
+            Ok(self.take(len)?.to_vec())
+        }
+    }
+
+    impl From<std::io::Error> for SandboxError {
+        fn from(err: std::io::Error) -> Self {
+            SandboxError::OsIsolationIo(err.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +1468,93 @@ mod tests {
         .unwrap();
         let module = runtime.compile(&bytes).unwrap();
         assert!(runtime.execute_tick(&module, b"{}").is_err());
+    }
+
+    #[test]
+    #[cfg(all(feature = "os-cgroup", target_os = "linux"))]
+    fn cgroup_fallback_only_allows_permission_or_read_only_errors() {
+        assert!(linux_os_isolation::is_cgroup_permission_fallback(
+            &std::io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(linux_os_isolation::is_cgroup_permission_fallback(
+            &std::io::Error::from_raw_os_error(libc::EROFS)
+        ));
+        assert!(!linux_os_isolation::is_cgroup_permission_fallback(
+            &std::io::Error::from_raw_os_error(libc::ENOENT)
+        ));
+    }
+
+    #[test]
+    #[cfg(all(feature = "os-seccomp", target_os = "linux"))]
+    fn seccomp_allowlist_builds_arch_check_and_default_kill() {
+        const ARCH: u32 = 0xc000_003e;
+        const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+        const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+        let filters = linux_os_isolation::build_seccomp_allowlist(ARCH, &[libc::SYS_read]);
+        assert_eq!(filters.len(), 7);
+        assert_eq!(filters[0].code, BPF_LD_W_ABS);
+        assert_eq!(filters[1].k, ARCH);
+        assert_eq!(filters[2].code, BPF_RET_K);
+        assert_eq!(filters[2].k, SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(filters[4].k, libc::SYS_read as u32);
+        assert_eq!(filters[6].k, SECCOMP_RET_KILL_PROCESS);
+    }
+
+    #[test]
+    #[cfg(all(feature = "os-isolation", target_os = "linux"))]
+    fn os_process_isolation_executes_tick_in_child_process() {
+        let runtime = SandboxRuntime::new(SandboxConfig {
+            isolation: IsolationMode::OsProcess,
+            ..SandboxConfig::default()
+        })
+        .unwrap();
+        let module = runtime.compile(&valid_echo_module()).unwrap();
+        let output = runtime.execute_tick(&module, br#"{"tick":1}"#).unwrap();
+        assert_eq!(output.command_json, b"[]");
+        assert_eq!(output.host_call_budget, HostCallBudget::default());
+    }
+
+    #[test]
+    #[cfg(all(feature = "os-isolation", target_os = "linux"))]
+    fn os_process_isolation_kills_timed_out_process_group() {
+        let bytes = wasm(
+            r#"
+            (module
+              (memory (export "memory") 1 1024)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "free") (param i32) (param i32))
+              (func (export "tick") (param i32 i32 i32) (result i32)
+                (loop $again br $again)
+                (i32.const 0)))
+            "#,
+        );
+        let runtime = SandboxRuntime::new(SandboxConfig {
+            isolation: IsolationMode::OsProcess,
+            max_fuel: u64::MAX,
+            tick_timeout_ms: 50,
+            ..SandboxConfig::default()
+        })
+        .unwrap();
+        let module = runtime.compile(&bytes).unwrap();
+        assert!(matches!(
+            runtime.execute_tick(&module, b"{}"),
+            Err(SandboxError::OsIsolationTimedOut { timeout_ms: 50 })
+        ));
+    }
+
+    #[test]
+    #[cfg(not(all(feature = "os-isolation", target_os = "linux")))]
+    fn os_process_isolation_reports_unavailable_without_linux_feature() {
+        let runtime = SandboxRuntime::new(SandboxConfig {
+            isolation: IsolationMode::OsProcess,
+            ..SandboxConfig::default()
+        })
+        .unwrap();
+        let module = runtime.compile(&valid_echo_module()).unwrap();
+        assert!(matches!(
+            runtime.execute_tick(&module, b"{}"),
+            Err(SandboxError::OsIsolationUnavailable)
+        ));
     }
 }

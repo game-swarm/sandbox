@@ -301,6 +301,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -963,6 +973,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "swarm-wasm-sandbox"
 version = "0.1.0"
 dependencies = [
+ "ctor",
+ "libc",
  "thiserror 2.0.18",
  "wasmparser 0.221.3",
  "wasmtime",

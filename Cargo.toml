@@ -5,9 +5,20 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+ctor = { version = "0.2", optional = true }
+libc = { version = "0.2", optional = true }
 thiserror = "2"
 wasmparser = "0.221"
 wasmtime = "=30.0"
+
+[features]
+default = []
+os-isolation = ["dep:ctor", "dep:libc"]
+os-cgroup = ["os-isolation"]
+os-network-namespace = ["os-isolation"]
+os-readonly-root = ["os-isolation"]
+os-seccomp = ["os-isolation"]
+os-tmpfs = ["os-isolation"]
 
 [dev-dependencies]
 wat = "1"
