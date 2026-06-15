@@ -1,2 +1,11 @@
-/target/
-/.hermes_docs/
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+rustc-ice-*.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
