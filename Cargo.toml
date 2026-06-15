@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+blake3 = "1"
 ctor = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 thiserror = "2"

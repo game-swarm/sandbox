@@ -9,3 +9,6 @@ rustc-ice-*.txt
 .vscode/
 *.swp
 *~
+
+# Hermes worker scratch docs
+.hermes_docs/

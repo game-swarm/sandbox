@@ -1,5 +1,7 @@
 //! WASM sandbox runtime baseline for Swarm P0-4.
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 use wasmparser::{Parser, Payload};
 use wasmtime::{
@@ -136,6 +138,11 @@ pub enum SandboxError {
     Wasmtime(#[from] wasmtime::Error),
     #[error("memory access error: {0}")]
     MemoryAccess(String),
+    #[error("compiled module cache miss for hash {module_hash} and wasmtime {wasmtime_version}")]
+    ModuleCacheMiss {
+        module_hash: String,
+        wasmtime_version: String,
+    },
     #[error("linear memory export `memory` is required")]
     MissingMemory,
     #[error("integer pointer must be non-negative")]
@@ -180,6 +187,102 @@ pub struct CompiledModule {
         allow(dead_code)
     )]
     wasm_bytes: Vec<u8>,
+    module_hash: String,
+    wasmtime_version: String,
+}
+
+impl CompiledModule {
+    pub fn module_hash(&self) -> &str {
+        &self.module_hash
+    }
+
+    pub fn wasmtime_version(&self) -> &str {
+        &self.wasmtime_version
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCacheKey {
+    pub module_hash: String,
+    pub wasmtime_version: String,
+}
+
+impl ModuleCacheKey {
+    pub fn new(module_hash: impl Into<String>, wasmtime_version: impl Into<String>) -> Self {
+        Self {
+            module_hash: module_hash.into(),
+            wasmtime_version: wasmtime_version.into(),
+        }
+    }
+
+    pub fn for_wasm(wasm_bytes: &[u8]) -> Self {
+        Self::for_wasm_with_version(wasm_bytes, wasmtime_version())
+    }
+
+    pub fn for_wasm_with_version(wasm_bytes: &[u8], wasmtime_version: impl Into<String>) -> Self {
+        Self::new(wasm_hash(wasm_bytes), wasmtime_version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedNativeModule {
+    pub key: ModuleCacheKey,
+    pub native_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModuleCacheStats {
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub recompiles: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompiledModuleCache {
+    entries: HashMap<ModuleCacheKey, CachedNativeModule>,
+    hits: u64,
+    misses: u64,
+    recompiles: u64,
+}
+
+impl CompiledModuleCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, key: &ModuleCacheKey) -> Option<&CachedNativeModule> {
+        self.entries.get(key)
+    }
+
+    pub fn insert(&mut self, cached: CachedNativeModule) -> Option<CachedNativeModule> {
+        self.entries.insert(cached.key.clone(), cached)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn stats(&self) -> ModuleCacheStats {
+        ModuleCacheStats {
+            entries: self.entries.len(),
+            hits: self.hits,
+            misses: self.misses,
+            recompiles: self.recompiles,
+        }
+    }
+}
+
+pub fn wasmtime_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+pub fn wasm_hash(wasm_bytes: &[u8]) -> String {
+    blake3::hash(wasm_bytes).to_hex().to_string()
 }
 
 struct StoreState {
@@ -219,7 +322,81 @@ impl SandboxRuntime {
         Ok(CompiledModule {
             module,
             wasm_bytes: wasm_bytes.to_vec(),
+            module_hash: wasm_hash(wasm_bytes),
+            wasmtime_version: wasmtime_version().to_string(),
         })
+    }
+
+    pub fn precompile_native(&self, wasm_bytes: &[u8]) -> Result<CachedNativeModule, SandboxError> {
+        validate_wasmparser(wasm_bytes)?;
+        let native_bytes = self.engine.precompile_module(wasm_bytes)?;
+        let module = unsafe { Module::deserialize(&self.engine, &native_bytes)? };
+        validate_module_exports(&module)?;
+        validate_module_imports(&module)?;
+        Ok(CachedNativeModule {
+            key: ModuleCacheKey::for_wasm(wasm_bytes),
+            native_bytes,
+        })
+    }
+
+    pub fn compile_from_cached_native(
+        &self,
+        cached: &CachedNativeModule,
+        wasm_bytes: &[u8],
+    ) -> Result<CompiledModule, SandboxError> {
+        let expected = ModuleCacheKey::for_wasm(wasm_bytes);
+        if cached.key != expected {
+            return Err(SandboxError::ModuleCacheMiss {
+                module_hash: expected.module_hash,
+                wasmtime_version: expected.wasmtime_version,
+            });
+        }
+        let module = unsafe { Module::deserialize(&self.engine, &cached.native_bytes)? };
+        validate_module_exports(&module)?;
+        validate_module_imports(&module)?;
+        Ok(CompiledModule {
+            module,
+            wasm_bytes: wasm_bytes.to_vec(),
+            module_hash: cached.key.module_hash.clone(),
+            wasmtime_version: cached.key.wasmtime_version.clone(),
+        })
+    }
+
+    pub fn compile_cached(
+        &self,
+        cache: &mut CompiledModuleCache,
+        wasm_bytes: &[u8],
+    ) -> Result<CompiledModule, SandboxError> {
+        self.compile_cached_with_version(cache, wasm_bytes, wasmtime_version())
+    }
+
+    pub fn compile_cached_with_version(
+        &self,
+        cache: &mut CompiledModuleCache,
+        wasm_bytes: &[u8],
+        stored_wasmtime_version: &str,
+    ) -> Result<CompiledModule, SandboxError> {
+        validate_wasmparser(wasm_bytes)?;
+        let current_key = ModuleCacheKey::for_wasm(wasm_bytes);
+        let requested_key =
+            ModuleCacheKey::for_wasm_with_version(wasm_bytes, stored_wasmtime_version);
+
+        if stored_wasmtime_version == wasmtime_version() {
+            if let Some(cached) = cache.get(&current_key).cloned() {
+                cache.hits = cache.hits.saturating_add(1);
+                return self.compile_from_cached_native(&cached, wasm_bytes);
+            }
+            cache.misses = cache.misses.saturating_add(1);
+        } else {
+            cache.misses = cache.misses.saturating_add(1);
+            cache.recompiles = cache.recompiles.saturating_add(1);
+            cache.entries.remove(&requested_key);
+        }
+
+        let cached = self.precompile_native(wasm_bytes)?;
+        let compiled = self.compile_from_cached_native(&cached, wasm_bytes)?;
+        cache.insert(cached);
+        Ok(compiled)
     }
 
     pub fn execute_tick(
@@ -1359,6 +1536,71 @@ mod tests {
         let runtime = SandboxRuntime::default();
         let module = runtime.compile(&valid_echo_module()).unwrap();
         let output = runtime.execute_tick(&module, br#"{"tick":1}"#).unwrap();
+        assert_eq!(output.command_json, b"[]");
+        assert_eq!(output.host_call_budget, HostCallBudget::default());
+    }
+
+    #[test]
+    fn cache_key_includes_wasm_hash_and_wasmtime_version() {
+        let wasm = valid_echo_module();
+        let key = ModuleCacheKey::for_wasm(&wasm);
+        assert_eq!(key.module_hash, wasm_hash(&wasm));
+        assert_eq!(key.wasmtime_version, wasmtime_version());
+
+        let other_version = ModuleCacheKey::for_wasm_with_version(&wasm, "wasmtime-next");
+        assert_eq!(other_version.module_hash, key.module_hash);
+        assert_ne!(other_version.wasmtime_version, key.wasmtime_version);
+    }
+
+    #[test]
+    fn compile_cached_hits_after_deploy_time_precompile() {
+        let runtime = SandboxRuntime::default();
+        let wasm = valid_echo_module();
+        let mut cache = CompiledModuleCache::new();
+
+        let first = runtime.compile_cached(&mut cache, &wasm).unwrap();
+        assert_eq!(first.module_hash(), wasm_hash(&wasm));
+        assert_eq!(first.wasmtime_version(), wasmtime_version());
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 0);
+
+        let second = runtime.compile_cached(&mut cache, &wasm).unwrap();
+        assert_eq!(second.module_hash(), first.module_hash());
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn compile_cached_recompiles_when_wasmtime_version_changes() {
+        let runtime = SandboxRuntime::default();
+        let wasm = valid_echo_module();
+        let mut cache = CompiledModuleCache::new();
+        let old_key = ModuleCacheKey::for_wasm_with_version(&wasm, "wasmtime-old");
+        cache.insert(CachedNativeModule {
+            key: old_key.clone(),
+            native_bytes: vec![1, 2, 3],
+        });
+
+        let compiled = runtime
+            .compile_cached_with_version(&mut cache, &wasm, &old_key.wasmtime_version)
+            .unwrap();
+        assert_eq!(compiled.wasmtime_version(), wasmtime_version());
+        assert!(cache.get(&old_key).is_none());
+        assert!(cache.get(&ModuleCacheKey::for_wasm(&wasm)).is_some());
+        assert_eq!(cache.stats().recompiles, 1);
+        assert_eq!(cache.stats().misses, 1);
+    }
+
+    #[test]
+    fn executes_tick_from_cached_native_module() {
+        let runtime = SandboxRuntime::default();
+        let wasm = valid_echo_module();
+        let mut cache = CompiledModuleCache::new();
+        let module = runtime.compile_cached(&mut cache, &wasm).unwrap();
+
+        let output = runtime.execute_tick(&module, br#"{"tick":7}"#).unwrap();
         assert_eq!(output.command_json, b"[]");
         assert_eq!(output.host_call_budget, HostCallBudget::default());
     }
