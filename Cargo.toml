@@ -9,8 +9,8 @@ blake3 = "1"
 ctor = { version = "0.2", optional = true }
 libc = { version = "0.2", optional = true }
 thiserror = "2"
-wasmparser = "0.221"
-wasmtime = "=30.0"
+wasmparser = "0.226"
+wasmtime = "45"
 
 [features]
 default = []
