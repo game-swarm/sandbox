@@ -29,7 +29,7 @@ pub const DEFAULT_PATH_FIND_PER_TICK: u32 = 10;
 pub const DEFAULT_OBJECTS_IN_RANGE_PER_TICK: u32 = 5;
 pub const DEFAULT_TICK_TIMEOUT_MS: u64 = 2_500;
 
-const RESULT_STRUCT_BYTES: i32 = 8;
+const RESULT_STRUCT_BYTES: i32 = 16;
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
 const CHILD_ENV: &str = "SWARM_WASM_SANDBOX_CHILD";
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
@@ -112,6 +112,7 @@ pub struct HostCallBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickOutput {
     pub command_json: Vec<u8>,
+    pub messages: Vec<u8>,
     pub host_call_budget: HostCallBudget,
 }
 
@@ -467,12 +468,20 @@ impl SandboxRuntime {
             .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
         let output_ptr = u32::from_le_bytes(result[0..4].try_into().expect("slice length"));
         let output_len = u32::from_le_bytes(result[4..8].try_into().expect("slice length"));
-        if output_len as usize > self.config.max_output_json_bytes {
-            let _ = free.call(&mut store, (output_ptr as i32, output_len as i32));
+        let message_ptr = u32::from_le_bytes(result[8..12].try_into().expect("slice length"));
+        let message_len = u32::from_le_bytes(result[12..16].try_into().expect("slice length"));
+        let total_output_len = output_len as usize + message_len as usize;
+        if total_output_len > self.config.max_output_json_bytes {
+            if output_len != 0 {
+                let _ = free.call(&mut store, (output_ptr as i32, output_len as i32));
+            }
+            if message_len != 0 {
+                let _ = free.call(&mut store, (message_ptr as i32, message_len as i32));
+            }
             let _ = free.call(&mut store, (snapshot_ptr, snapshot_len));
             let _ = free.call(&mut store, (result_ptr, RESULT_STRUCT_BYTES));
             return Err(SandboxError::OutputTooLarge {
-                actual: output_len as usize,
+                actual: total_output_len,
             });
         }
 
@@ -481,13 +490,29 @@ impl SandboxRuntime {
         memory
             .read(&mut store, output_range.start, &mut command_json)
             .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
+        let messages = if message_len == 0 {
+            Vec::new()
+        } else {
+            let message_range = checked_u32_range(memory, &mut store, message_ptr, message_len)?;
+            let mut messages = vec![0_u8; message_len as usize];
+            memory
+                .read(&mut store, message_range.start, &mut messages)
+                .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
+            messages
+        };
 
-        free.call(&mut store, (output_ptr as i32, output_len as i32))?;
+        if output_len != 0 {
+            free.call(&mut store, (output_ptr as i32, output_len as i32))?;
+        }
+        if message_len != 0 {
+            free.call(&mut store, (message_ptr as i32, message_len as i32))?;
+        }
         free.call(&mut store, (snapshot_ptr, snapshot_len))?;
         free.call(&mut store, (result_ptr, RESULT_STRUCT_BYTES))?;
 
         Ok(TickOutput {
             command_json,
+            messages,
             host_call_budget: store.data().host_budget.clone(),
         })
     }
@@ -969,6 +994,7 @@ mod linux_os_isolation {
         stdout.write_all(&output.host_call_budget.path_find_calls.to_le_bytes())?;
         stdout.write_all(&output.host_call_budget.objects_in_range_calls.to_le_bytes())?;
         write_bytes(&mut stdout, &output.command_json)?;
+        write_bytes(&mut stdout, &output.messages)?;
         Ok(())
     }
 
@@ -1003,8 +1029,14 @@ mod linux_os_isolation {
                     objects_in_range_calls: cursor.u32()?,
                 };
                 let command_json = cursor.bytes()?;
+                let messages = if cursor.remaining() == 0 {
+                    Vec::new()
+                } else {
+                    cursor.bytes()?
+                };
                 Ok(ChildResponse::Ok(TickOutput {
                     command_json,
+                    messages,
                     host_call_budget,
                 }))
             }
