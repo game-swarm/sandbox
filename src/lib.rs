@@ -42,6 +42,8 @@ const ALLOWED_IMPORTS: &[(&str, &str)] = &[
     ("env", "host_path_find"),
     ("env", "host_get_world_config"),
     ("env", "host_get_world_rules"),
+    ("env", "host_get_random"),
+    ("env", "host_set_random_seed"),
 ];
 
 #[derive(Debug, Clone)]
@@ -290,6 +292,7 @@ struct StoreState {
     limits: StoreLimits,
     host_budget: HostCallBudget,
     config: SandboxConfig,
+    random_seed: u64,
 }
 
 impl SandboxRuntime {
@@ -427,6 +430,7 @@ impl SandboxRuntime {
                     .build(),
                 host_budget: HostCallBudget::default(),
                 config: self.config.clone(),
+                random_seed: 0,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -680,6 +684,31 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
             }
         },
     )?;
+    linker.func_wrap(
+        "env",
+        "host_set_random_seed",
+        |mut caller: Caller<'_, StoreState>, seed: u64| -> i32 {
+            match charge_host_call(&mut caller, HostCallKind::Random) {
+                Ok(_) => {
+                    caller.data_mut().random_seed = seed;
+                    0
+                }
+                Err(_) => -1,
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env",
+        "host_get_random",
+        |mut caller: Caller<'_, StoreState>, stream: u64| -> u64 {
+            if charge_host_call(&mut caller, HostCallKind::Random).is_err() {
+                return 0;
+            }
+            let state = caller.data_mut();
+            state.random_seed = splitmix64(state.random_seed ^ stream);
+            state.random_seed
+        },
+    )?;
     Ok(())
 }
 
@@ -689,6 +718,7 @@ enum HostCallKind {
     PathFind,
     WorldConfig,
     WorldRules,
+    Random,
 }
 
 fn charge_host_call(
@@ -730,8 +760,16 @@ fn charge_host_call(
             }
             Ok(0)
         }
-        HostCallKind::WorldConfig | HostCallKind::WorldRules => Ok(0),
+        HostCallKind::WorldConfig | HostCallKind::WorldRules | HostCallKind::Random => Ok(0),
     }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = value;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 fn checked_caller_range(
@@ -1297,7 +1335,7 @@ mod linux_os_isolation {
                     return Err(CgroupRootError {
                         message: format!("probe cgroup root {}: {err}", path.display()),
                         is_permission_fallback: false,
-                    })
+                    });
                 }
             }
         }
