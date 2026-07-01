@@ -5,12 +5,25 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+async-nats = "0.42"
 blake3 = "1"
 ctor = { version = "0.2", optional = true }
+futures-util = "0.3"
 libc = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
 wasmparser = "0.248"
 wasmtime = "45"
+
+[lib]
+name = "swarm_wasm_sandbox"
+
+[[bin]]
+name = "swarm-sandbox"
+path = "src/main.rs"
 
 [features]
 default = []
