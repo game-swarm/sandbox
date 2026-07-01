@@ -1,6 +1,6 @@
 //! WASM sandbox runtime baseline for Swarm P0-4.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use thiserror::Error;
 use wasmparser::{Parser, Payload};
@@ -297,6 +297,7 @@ struct StoreState {
     host_budget: HostCallBudget,
     config: SandboxConfig,
     random_seed: u64,
+    snapshot: serde_json::Value,
 }
 
 impl SandboxRuntime {
@@ -435,6 +436,7 @@ impl SandboxRuntime {
                 host_budget: HostCallBudget::default(),
                 config: self.config.clone(),
                 random_seed: 0,
+                snapshot: serde_json::from_slice(snapshot_json).unwrap_or(serde_json::Value::Null),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -617,24 +619,33 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
     linker.func_wrap(
         "env",
         "host_get_terrain",
-        |mut caller: Caller<'_, StoreState>, _x: i32, _y: i32| -> i32 {
-            charge_host_call(&mut caller, HostCallKind::Terrain).unwrap_or(-1)
+        |mut caller: Caller<'_, StoreState>, x: i32, y: i32| -> i32 {
+            if charge_host_call(&mut caller, HostCallKind::Terrain).is_err() {
+                return -1;
+            }
+            terrain_at(caller.data().snapshot(), x, y)
+                .map(terrain_code)
+                .unwrap_or(-1)
         },
     )?;
     linker.func_wrap(
         "env",
         "host_get_objects_in_range",
         |mut caller: Caller<'_, StoreState>,
-         _x: i32,
-         _y: i32,
-         _range: i32,
+         x: i32,
+         y: i32,
+         range: i32,
          out_ptr: i32,
          out_len: i32|
          -> i32 {
-            match charge_host_call(&mut caller, HostCallKind::ObjectsInRange)
-                .and_then(|_| checked_caller_range(&mut caller, out_ptr, out_len).map(|_| ()))
-            {
-                Ok(()) => 0,
+            if range < 0 {
+                return -1;
+            }
+            match charge_host_call(&mut caller, HostCallKind::ObjectsInRange).and_then(|_| {
+                let payload = objects_in_range(caller.data().snapshot(), x, y, range);
+                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+            }) {
+                Ok(bytes) => bytes,
                 Err(_) => -1,
             }
         },
@@ -643,17 +654,18 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
         "env",
         "host_path_find",
         |mut caller: Caller<'_, StoreState>,
-         _from_x: i32,
-         _from_y: i32,
-         _to_x: i32,
-         _to_y: i32,
+         from_x: i32,
+         from_y: i32,
+         to_x: i32,
+         to_y: i32,
          out_ptr: i32,
          out_len: i32|
          -> i32 {
-            match charge_host_call(&mut caller, HostCallKind::PathFind)
-                .and_then(|_| checked_caller_range(&mut caller, out_ptr, out_len).map(|_| ()))
-            {
-                Ok(()) => 0,
+            match charge_host_call(&mut caller, HostCallKind::PathFind).and_then(|_| {
+                let payload = path_find(caller.data().snapshot(), from_x, from_y, to_x, to_y);
+                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+            }) {
+                Ok(bytes) => bytes,
                 Err(_) => -1,
             }
         },
@@ -667,11 +679,12 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
          out_ptr: i32,
          out_len: i32|
          -> i32 {
-            match checked_caller_range(&mut caller, key_ptr, key_len)
-                .and_then(|_| charge_host_call(&mut caller, HostCallKind::WorldConfig))
-                .and_then(|_| checked_caller_range(&mut caller, out_ptr, out_len).map(|_| ()))
-            {
-                Ok(()) => 0,
+            match charge_host_call(&mut caller, HostCallKind::WorldConfig).and_then(|_| {
+                let key = read_guest_string(&mut caller, key_ptr, key_len)?;
+                let payload = world_config_lookup(caller.data().snapshot(), &key);
+                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+            }) {
+                Ok(bytes) => bytes,
                 Err(_) => -1,
             }
         },
@@ -680,10 +693,11 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
         "env",
         "host_get_world_rules",
         |mut caller: Caller<'_, StoreState>, out_ptr: i32, out_len: i32| -> i32 {
-            match charge_host_call(&mut caller, HostCallKind::WorldRules)
-                .and_then(|_| checked_caller_range(&mut caller, out_ptr, out_len).map(|_| ()))
-            {
-                Ok(()) => 0,
+            match charge_host_call(&mut caller, HostCallKind::WorldRules).and_then(|_| {
+                let payload = world_rules(caller.data().snapshot());
+                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+            }) {
+                Ok(bytes) => bytes,
                 Err(_) => -1,
             }
         },
@@ -786,6 +800,217 @@ fn checked_caller_range(
         .and_then(|export| export.into_memory())
         .ok_or(SandboxError::MissingMemory)?;
     checked_range(memory, caller, ptr, len)
+}
+
+fn caller_memory(caller: &mut Caller<'_, StoreState>) -> Result<Memory, SandboxError> {
+    caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+        .ok_or(SandboxError::MissingMemory)
+}
+
+fn read_guest_string(
+    caller: &mut Caller<'_, StoreState>,
+    ptr: i32,
+    len: i32,
+) -> Result<String, SandboxError> {
+    let memory = caller_memory(caller)?;
+    let range = checked_range(memory, &mut *caller, ptr, len)?;
+    let mut bytes = vec![0_u8; range.len()];
+    memory
+        .read(&mut *caller, range.start, &mut bytes)
+        .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
+    String::from_utf8(bytes).map_err(|err| SandboxError::MemoryAccess(err.to_string()))
+}
+
+fn write_json_to_guest(
+    caller: &mut Caller<'_, StoreState>,
+    out_ptr: i32,
+    out_len: i32,
+    value: &serde_json::Value,
+) -> Result<i32, SandboxError> {
+    let memory = caller_memory(caller)?;
+    let range = checked_range(memory, &mut *caller, out_ptr, out_len)?;
+    let bytes = serde_json::to_vec(value).map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
+    if bytes.len() > range.len() {
+        return Err(SandboxError::MemoryOutOfBounds {
+            ptr: out_ptr as u32,
+            len: bytes.len() as u32,
+            memory_len: range.len(),
+        });
+    }
+    memory
+        .write(&mut *caller, range.start, &bytes)
+        .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
+    usize_to_i32(bytes.len())
+}
+
+impl StoreState {
+    fn snapshot(&self) -> &serde_json::Value {
+        &self.snapshot
+    }
+}
+
+fn terrain_at(snapshot: &serde_json::Value, x: i32, y: i32) -> Option<&str> {
+    snapshot
+        .get("visible_tiles")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tiles| {
+            tiles.iter().find_map(|tile| {
+                (json_i32(tile.get("x"))? == x && json_i32(tile.get("y"))? == y)
+                    .then(|| tile.get("terrain")?.as_str())
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            snapshot
+                .get("room")
+                .and_then(|room| room.get("terrain"))
+                .and_then(|terrain| terrain.get(y as usize))
+                .and_then(|row| {
+                    row.as_array()
+                        .and_then(|items| items.get(x as usize))
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| {
+                            row.as_str()
+                                .and_then(|line| line.as_bytes().get(x as usize).copied())
+                                .and_then(|byte| match byte {
+                                    b'.' => Some("Plain"),
+                                    b'~' => Some("Swamp"),
+                                    b'#' => Some("Wall"),
+                                    _ => None,
+                                })
+                        })
+                })
+        })
+}
+
+fn terrain_code(terrain: &str) -> i32 {
+    match terrain {
+        "Plain" | "plain" => 0,
+        "Swamp" | "swamp" => 1,
+        "Wall" | "wall" => 2,
+        _ => -1,
+    }
+}
+
+fn objects_in_range(
+    snapshot: &serde_json::Value,
+    x: i32,
+    y: i32,
+    range: i32,
+) -> serde_json::Value {
+    let entities = snapshot
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(|entities| {
+            entities
+                .iter()
+                .filter(|entity| {
+                    entity_position(entity).is_some_and(|(ex, ey)| hex_distance_axial(x, y, ex, ey) <= range)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(entities)
+}
+
+fn path_find(
+    snapshot: &serde_json::Value,
+    from_x: i32,
+    from_y: i32,
+    to_x: i32,
+    to_y: i32,
+) -> serde_json::Value {
+    if from_x == to_x && from_y == to_y {
+        return serde_json::json!([{ "x": from_x, "y": from_y }]);
+    }
+    let mut queue = VecDeque::from([(from_x, from_y)]);
+    let mut came_from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
+    came_from.insert((from_x, from_y), (from_x, from_y));
+    while let Some((x, y)) = queue.pop_front() {
+        for (nx, ny) in hex_neighbors(x, y) {
+            if came_from.contains_key(&(nx, ny)) || !is_passable_snapshot(snapshot, nx, ny) {
+                continue;
+            }
+            came_from.insert((nx, ny), (x, y));
+            if nx == to_x && ny == to_y {
+                let mut path = Vec::new();
+                let mut current = (to_x, to_y);
+                path.push(serde_json::json!({ "x": current.0, "y": current.1 }));
+                while current != (from_x, from_y) {
+                    current = came_from[&current];
+                    path.push(serde_json::json!({ "x": current.0, "y": current.1 }));
+                }
+                path.reverse();
+                return serde_json::Value::Array(path);
+            }
+            queue.push_back((nx, ny));
+        }
+    }
+    serde_json::Value::Array(Vec::new())
+}
+
+fn is_passable_snapshot(snapshot: &serde_json::Value, x: i32, y: i32) -> bool {
+    terrain_at(snapshot, x, y).is_some_and(|terrain| terrain_code(terrain) != 2)
+}
+
+fn hex_neighbors(x: i32, y: i32) -> [(i32, i32); 6] {
+    [
+        (x, y - 1),
+        (x + 1, y - 1),
+        (x + 1, y),
+        (x, y + 1),
+        (x - 1, y + 1),
+        (x - 1, y),
+    ]
+}
+
+fn hex_distance_axial(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+    let dq = (ax - bx).abs();
+    let dr = (ay - by).abs();
+    let ds = (ax + ay - bx - by).abs();
+    dq.max(dr).max(ds)
+}
+
+fn entity_position(entity: &serde_json::Value) -> Option<(i32, i32)> {
+    let position = entity.get("position").or_else(|| {
+        entity
+            .as_object()
+            .and_then(|object| object.values().find_map(|value| value.get("position")))
+    })?;
+    Some((json_i32(position.get("x"))?, json_i32(position.get("y"))?))
+}
+
+fn json_i32(value: Option<&serde_json::Value>) -> Option<i32> {
+    value
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn world_config_lookup(snapshot: &serde_json::Value, key: &str) -> serde_json::Value {
+    let config = snapshot
+        .pointer("/world_config/config")
+        .or_else(|| snapshot.get("world_config"))
+        .or_else(|| snapshot.get("config"));
+    if key.trim().is_empty() {
+        return config.cloned().unwrap_or(serde_json::Value::Null);
+    }
+    config
+        .and_then(|config| config.get(key))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn world_rules(snapshot: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "ruleset": "snapshot",
+        "room_size": snapshot.get("room").and_then(|room| room.get("size")).cloned().unwrap_or(serde_json::json!(50)),
+        "visibility_radius": snapshot.get("visibility_radius").cloned().unwrap_or(serde_json::json!(0)),
+        "snapshot_tick": snapshot.get("tick").cloned().unwrap_or(serde_json::Value::Null),
+        "active_mods": snapshot.pointer("/world_config/config/custom_actions").cloned().unwrap_or(serde_json::json!([])),
+    })
 }
 
 fn checked_range(
