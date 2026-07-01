@@ -278,6 +278,10 @@ impl CompiledModuleCache {
             recompiles: self.recompiles,
         }
     }
+
+    pub fn record_miss(&mut self) {
+        self.misses = self.misses.saturating_add(1);
+    }
 }
 
 pub fn wasmtime_version() -> &'static str {
