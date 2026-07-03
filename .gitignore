@@ -12,3 +12,4 @@ rustc-ice-*.txt
 
 # Hermes worker scratch docs
 .hermes_docs/
+vendor/
