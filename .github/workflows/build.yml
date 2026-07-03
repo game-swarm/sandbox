@@ -1,0 +1,19 @@
+name: Build & Push
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Log in to registry
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login docker.repo.kagurazakalan.com -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+      - name: Build & Push
+        run: |
+          docker build --network host -t docker.repo.kagurazakalan.com/swarm/sandbox:latest .
+          docker push docker.repo.kagurazakalan.com/swarm/sandbox:latest
