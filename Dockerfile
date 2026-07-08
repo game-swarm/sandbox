@@ -1,7 +1,7 @@
 FROM rust:latest AS build
 WORKDIR /app
 COPY . .
-RUN cargo build --release --locked --offline --bin swarm-sandbox
+RUN cargo build --release --locked --bin swarm-sandbox
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*

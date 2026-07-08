@@ -1,15 +1,6 @@
-# Rust
-/target
-**/*.rs.bk
-*.pdb
-rustc-ice-*.txt
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*~
-
-# Hermes worker scratch docs
-.hermes_docs/
-vendor/
+target/
+*.pem
+*.key
+*.cert
+.env
+.env.*

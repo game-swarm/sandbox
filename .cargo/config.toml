@@ -1,5 +1,2 @@
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
+# Sandbox uses standard crates.io — vendor/ directory is removed.
+# This file is intentionally minimal for GitHub CI compatibility.
