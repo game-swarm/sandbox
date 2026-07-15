@@ -9,6 +9,8 @@ use wasmtime::{
     StoreLimits, StoreLimitsBuilder, TypedFunc,
 };
 
+pub const DEFAULT_VALIDATION_POLICY_VERSION: &str = "raw-wasm-v1";
+
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
 use std::io::{Read, Write};
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
@@ -59,6 +61,7 @@ pub struct SandboxConfig {
     pub max_objects_in_range_per_tick: u32,
     pub max_output_json_bytes: usize,
     pub tick_timeout_ms: u64,
+    pub wasm_simd: bool,
     pub isolation: IsolationMode,
     pub os_isolation: OsIsolationPolicy,
 }
@@ -82,12 +85,12 @@ pub struct OsIsolationPolicy {
 impl Default for OsIsolationPolicy {
     fn default() -> Self {
         Self {
-            seccomp: false,
-            cgroup: false,
-            network_namespace: false,
-            read_only_root: false,
-            tmpfs_tmp: false,
-            allow_permission_fallback: true,
+            seccomp: true,
+            cgroup: true,
+            network_namespace: true,
+            read_only_root: true,
+            tmpfs_tmp: true,
+            allow_permission_fallback: false,
         }
     }
 }
@@ -102,8 +105,33 @@ impl Default for SandboxConfig {
             max_objects_in_range_per_tick: DEFAULT_OBJECTS_IN_RANGE_PER_TICK,
             max_output_json_bytes: MAX_OUTPUT_JSON_BYTES,
             tick_timeout_ms: DEFAULT_TICK_TIMEOUT_MS,
-            isolation: IsolationMode::InProcess,
+            wasm_simd: false,
+            isolation: IsolationMode::OsProcess,
             os_isolation: OsIsolationPolicy::default(),
+        }
+    }
+}
+
+impl SandboxConfig {
+    pub fn development() -> Self {
+        Self {
+            wasm_simd: false,
+            isolation: IsolationMode::InProcess,
+            os_isolation: OsIsolationPolicy::development(),
+            ..Self::default()
+        }
+    }
+}
+
+impl OsIsolationPolicy {
+    pub fn development() -> Self {
+        Self {
+            seccomp: false,
+            cgroup: false,
+            network_namespace: false,
+            read_only_root: false,
+            tmpfs_tmp: false,
+            allow_permission_fallback: true,
         }
     }
 }
@@ -182,6 +210,8 @@ pub enum SandboxError {
     OsIsolationChildFailed(String),
     #[error("OS process isolation timed out after {timeout_ms}ms")]
     OsIsolationTimedOut { timeout_ms: u64 },
+    #[error("host RNG requires snapshot field `{0}`")]
+    MissingHostRandomField(&'static str),
 }
 
 impl SandboxError {
@@ -200,6 +230,7 @@ impl SandboxError {
             | SandboxError::WrongExportType { .. }
             | SandboxError::IllegalImport { .. }
             | SandboxError::UnsupportedImportType { .. }
+            | SandboxError::MissingHostRandomField(_)
             | SandboxError::TickFailed(_)
             | SandboxError::OutputTooLarge { .. }
             | SandboxError::OsIsolationProtocol(_) => -5,
@@ -229,6 +260,7 @@ pub struct CompiledModule {
     wasm_bytes: Vec<u8>,
     module_hash: String,
     wasmtime_version: String,
+    validation_policy_version: String,
 }
 
 impl CompiledModule {
@@ -239,19 +271,37 @@ impl CompiledModule {
     pub fn wasmtime_version(&self) -> &str {
         &self.wasmtime_version
     }
+
+    pub fn validation_policy_version(&self) -> &str {
+        &self.validation_policy_version
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleCacheKey {
     pub module_hash: String,
     pub wasmtime_version: String,
+    pub validation_policy_version: String,
 }
 
 impl ModuleCacheKey {
     pub fn new(module_hash: impl Into<String>, wasmtime_version: impl Into<String>) -> Self {
+        Self::new_with_policy(
+            module_hash,
+            wasmtime_version,
+            DEFAULT_VALIDATION_POLICY_VERSION,
+        )
+    }
+
+    pub fn new_with_policy(
+        module_hash: impl Into<String>,
+        wasmtime_version: impl Into<String>,
+        validation_policy_version: impl Into<String>,
+    ) -> Self {
         Self {
             module_hash: module_hash.into(),
             wasmtime_version: wasmtime_version.into(),
+            validation_policy_version: validation_policy_version.into(),
         }
     }
 
@@ -261,6 +311,29 @@ impl ModuleCacheKey {
 
     pub fn for_wasm_with_version(wasm_bytes: &[u8], wasmtime_version: impl Into<String>) -> Self {
         Self::new(wasm_hash(wasm_bytes), wasmtime_version)
+    }
+
+    pub fn for_wasm_with_policy(
+        wasm_bytes: &[u8],
+        validation_policy_version: impl Into<String>,
+    ) -> Self {
+        Self::for_wasm_with_version_and_policy(
+            wasm_bytes,
+            wasmtime_version(),
+            validation_policy_version,
+        )
+    }
+
+    pub fn for_wasm_with_version_and_policy(
+        wasm_bytes: &[u8],
+        wasmtime_version: impl Into<String>,
+        validation_policy_version: impl Into<String>,
+    ) -> Self {
+        Self::new_with_policy(
+            wasm_hash(wasm_bytes),
+            wasmtime_version,
+            validation_policy_version,
+        )
     }
 }
 
@@ -273,6 +346,10 @@ pub struct CachedNativeModule {
 impl CachedNativeModule {
     pub fn key(&self) -> &ModuleCacheKey {
         &self.key
+    }
+
+    pub fn compiled_artifact_hash(&self) -> String {
+        wasm_hash(&self.native_bytes)
     }
 
     #[cfg(test)]
@@ -361,7 +438,7 @@ impl SandboxRuntime {
         wasmtime_config.max_wasm_stack(1024 * 1024);
         wasmtime_config.cranelift_opt_level(OptLevel::Speed);
         wasmtime_config.wasm_threads(false);
-        wasmtime_config.wasm_simd(true);
+        wasmtime_config.wasm_simd(config.wasm_simd);
         wasmtime_config.wasm_relaxed_simd(false);
         wasmtime_config.epoch_interruption(true);
 
@@ -381,10 +458,19 @@ impl SandboxRuntime {
             wasm_bytes: wasm_bytes.to_vec(),
             module_hash: wasm_hash(wasm_bytes),
             wasmtime_version: wasmtime_version().to_string(),
+            validation_policy_version: DEFAULT_VALIDATION_POLICY_VERSION.to_string(),
         })
     }
 
     pub fn precompile_native(&self, wasm_bytes: &[u8]) -> Result<CachedNativeModule, SandboxError> {
+        self.precompile_native_with_policy(wasm_bytes, DEFAULT_VALIDATION_POLICY_VERSION)
+    }
+
+    pub fn precompile_native_with_policy(
+        &self,
+        wasm_bytes: &[u8],
+        validation_policy_version: &str,
+    ) -> Result<CachedNativeModule, SandboxError> {
         validate_wasmparser(wasm_bytes)?;
         let native_bytes = self.engine.precompile_module(wasm_bytes)?;
         // The bytes passed to Wasmtime deserialization are generated by this engine in this
@@ -393,7 +479,7 @@ impl SandboxRuntime {
         validate_module_exports(&module)?;
         validate_module_imports(&module)?;
         Ok(CachedNativeModule {
-            key: ModuleCacheKey::for_wasm(wasm_bytes),
+            key: ModuleCacheKey::for_wasm_with_policy(wasm_bytes, validation_policy_version),
             native_bytes,
         })
     }
@@ -403,7 +489,20 @@ impl SandboxRuntime {
         cached: &CachedNativeModule,
         wasm_bytes: &[u8],
     ) -> Result<CompiledModule, SandboxError> {
-        let expected = ModuleCacheKey::for_wasm(wasm_bytes);
+        self.compile_from_cached_native_with_policy(
+            cached,
+            wasm_bytes,
+            DEFAULT_VALIDATION_POLICY_VERSION,
+        )
+    }
+
+    pub fn compile_from_cached_native_with_policy(
+        &self,
+        cached: &CachedNativeModule,
+        wasm_bytes: &[u8],
+        validation_policy_version: &str,
+    ) -> Result<CompiledModule, SandboxError> {
+        let expected = ModuleCacheKey::for_wasm_with_policy(wasm_bytes, validation_policy_version);
         if cached.key != expected {
             return Err(SandboxError::ModuleCacheMiss {
                 module_hash: expected.module_hash,
@@ -420,6 +519,7 @@ impl SandboxRuntime {
             wasm_bytes: wasm_bytes.to_vec(),
             module_hash: cached.key.module_hash.clone(),
             wasmtime_version: cached.key.wasmtime_version.clone(),
+            validation_policy_version: cached.key.validation_policy_version.clone(),
         })
     }
 
@@ -428,7 +528,12 @@ impl SandboxRuntime {
         cache: &mut CompiledModuleCache,
         wasm_bytes: &[u8],
     ) -> Result<CompiledModule, SandboxError> {
-        self.compile_cached_with_version(cache, wasm_bytes, wasmtime_version())
+        self.compile_cached_with_version_and_policy(
+            cache,
+            wasm_bytes,
+            wasmtime_version(),
+            DEFAULT_VALIDATION_POLICY_VERSION,
+        )
     }
 
     pub fn compile_cached_with_version(
@@ -437,15 +542,52 @@ impl SandboxRuntime {
         wasm_bytes: &[u8],
         stored_wasmtime_version: &str,
     ) -> Result<CompiledModule, SandboxError> {
+        self.compile_cached_with_version_and_policy(
+            cache,
+            wasm_bytes,
+            stored_wasmtime_version,
+            DEFAULT_VALIDATION_POLICY_VERSION,
+        )
+    }
+
+    pub fn compile_cached_with_policy(
+        &self,
+        cache: &mut CompiledModuleCache,
+        wasm_bytes: &[u8],
+        validation_policy_version: &str,
+    ) -> Result<CompiledModule, SandboxError> {
+        self.compile_cached_with_version_and_policy(
+            cache,
+            wasm_bytes,
+            wasmtime_version(),
+            validation_policy_version,
+        )
+    }
+
+    pub fn compile_cached_with_version_and_policy(
+        &self,
+        cache: &mut CompiledModuleCache,
+        wasm_bytes: &[u8],
+        stored_wasmtime_version: &str,
+        validation_policy_version: &str,
+    ) -> Result<CompiledModule, SandboxError> {
         validate_wasmparser(wasm_bytes)?;
-        let current_key = ModuleCacheKey::for_wasm(wasm_bytes);
-        let requested_key =
-            ModuleCacheKey::for_wasm_with_version(wasm_bytes, stored_wasmtime_version);
+        let current_key =
+            ModuleCacheKey::for_wasm_with_policy(wasm_bytes, validation_policy_version);
+        let requested_key = ModuleCacheKey::for_wasm_with_version_and_policy(
+            wasm_bytes,
+            stored_wasmtime_version,
+            validation_policy_version,
+        );
 
         if stored_wasmtime_version == wasmtime_version() {
             if let Some(cached) = cache.get(&current_key).cloned() {
                 cache.hits = cache.hits.saturating_add(1);
-                return self.compile_from_cached_native(&cached, wasm_bytes);
+                return self.compile_from_cached_native_with_policy(
+                    &cached,
+                    wasm_bytes,
+                    validation_policy_version,
+                );
             }
             cache.misses = cache.misses.saturating_add(1);
         } else {
@@ -454,8 +596,12 @@ impl SandboxRuntime {
             cache.entries.remove(&requested_key);
         }
 
-        let cached = self.precompile_native(wasm_bytes)?;
-        let compiled = self.compile_from_cached_native(&cached, wasm_bytes)?;
+        let cached = self.precompile_native_with_policy(wasm_bytes, validation_policy_version)?;
+        let compiled = self.compile_from_cached_native_with_policy(
+            &cached,
+            wasm_bytes,
+            validation_policy_version,
+        )?;
         cache.insert(cached);
         Ok(compiled)
     }
@@ -607,7 +753,8 @@ impl SandboxRuntime {
 
 impl Default for SandboxRuntime {
     fn default() -> Self {
-        Self::new(SandboxConfig::default()).expect("default sandbox runtime config must be valid")
+        Self::new(SandboxConfig::development())
+            .expect("development sandbox runtime config must be valid")
     }
 }
 
@@ -1155,17 +1302,17 @@ fn derive_random_bytes(
     hash_field(
         &mut hasher,
         2,
-        &snapshot_u64(snapshot, &["world_seed", "seed"]).to_le_bytes(),
+        &required_snapshot_u64(snapshot, "world_seed")?.to_le_bytes(),
     );
     hash_field(
         &mut hasher,
         3,
-        &snapshot_u64(snapshot, &["tick", "snapshot_tick"]).to_le_bytes(),
+        &required_snapshot_u64(snapshot, "tick")?.to_le_bytes(),
     );
     hash_field(
         &mut hasher,
         4,
-        &snapshot_u64(snapshot, &["actor_id", "entity_id", "drone_id"]).to_le_bytes(),
+        &required_snapshot_u64(snapshot, "actor_id")?.to_le_bytes(),
     );
     hash_field(&mut hasher, 5, &sequence.to_le_bytes());
 
@@ -1194,16 +1341,18 @@ fn write_uleb128(hasher: &mut blake3::Hasher, mut value: u64) {
     }
 }
 
-fn snapshot_u64(snapshot: &serde_json::Value, keys: &[&str]) -> u64 {
-    keys.iter()
-        .find_map(|key| {
-            snapshot.get(*key).and_then(|value| {
-                value
-                    .as_u64()
-                    .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-            })
+fn required_snapshot_u64(
+    snapshot: &serde_json::Value,
+    key: &'static str,
+) -> Result<u64, SandboxError> {
+    snapshot
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
         })
-        .unwrap_or(0)
+        .ok_or(SandboxError::MissingHostRandomField(key))
 }
 
 fn checked_range(
@@ -1415,6 +1564,7 @@ mod linux_os_isolation {
         writer.write_all(&config.max_objects_in_range_per_tick.to_le_bytes())?;
         writer.write_all(&(config.max_output_json_bytes as u64).to_le_bytes())?;
         writer.write_all(&config.tick_timeout_ms.to_le_bytes())?;
+        writer.write_all(&[config.wasm_simd as u8])?;
         writer.write_all(&[config.os_isolation.seccomp as u8])?;
         writer.write_all(&[config.os_isolation.cgroup as u8])?;
         writer.write_all(&[config.os_isolation.network_namespace as u8])?;
@@ -1433,6 +1583,7 @@ mod linux_os_isolation {
             max_objects_in_range_per_tick: cursor.u32()?,
             max_output_json_bytes: cursor.u64()? as usize,
             tick_timeout_ms: cursor.u64()?,
+            wasm_simd: cursor.bool()?,
             isolation: IsolationMode::InProcess,
             os_isolation: OsIsolationPolicy {
                 seccomp: cursor.bool()?,
@@ -1969,6 +2120,92 @@ mod tests {
         )
     }
 
+    fn simd_module() -> Vec<u8> {
+        wasm(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func $uses_simd (result i32)
+                (i32x4.extract_lane 0 (v128.const i32x4 1 2 3 4)))
+              (func (export "alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "free") (param i32) (param i32))
+              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+            "#,
+        )
+    }
+
+    #[test]
+    fn production_config_defaults_to_required_os_isolation_without_simd() {
+        let config = SandboxConfig::default();
+
+        assert_eq!(config.isolation, IsolationMode::OsProcess);
+        assert!(!config.wasm_simd);
+        assert!(config.os_isolation.seccomp);
+        assert!(config.os_isolation.cgroup);
+        assert!(config.os_isolation.network_namespace);
+        assert!(config.os_isolation.read_only_root);
+        assert!(config.os_isolation.tmpfs_tmp);
+        assert!(!config.os_isolation.allow_permission_fallback);
+    }
+
+    #[test]
+    fn development_config_is_explicitly_in_process_and_permissive() {
+        let config = SandboxConfig::development();
+
+        assert_eq!(config.isolation, IsolationMode::InProcess);
+        assert!(!config.wasm_simd);
+        assert!(!config.os_isolation.seccomp);
+        assert!(!config.os_isolation.cgroup);
+        assert!(!config.os_isolation.network_namespace);
+        assert!(!config.os_isolation.read_only_root);
+        assert!(!config.os_isolation.tmpfs_tmp);
+        assert!(config.os_isolation.allow_permission_fallback);
+    }
+
+    #[test]
+    fn wasm_simd_is_default_off_and_config_controlled() {
+        let wasm = simd_module();
+        let default_runtime = SandboxRuntime::new(SandboxConfig::development()).unwrap();
+        assert!(default_runtime.compile(&wasm).is_err());
+
+        let simd_runtime = SandboxRuntime::new(SandboxConfig {
+            wasm_simd: true,
+            ..SandboxConfig::development()
+        })
+        .unwrap();
+        assert!(simd_runtime.compile(&wasm).is_ok());
+    }
+
+    #[test]
+    fn host_rng_requires_seed_tick_and_actor_fields() {
+        let complete = serde_json::json!({
+            "world_seed": 42,
+            "tick": 7,
+            "actor_id": 99
+        });
+        assert_eq!(derive_random_bytes(&complete, 1, 16).unwrap().len(), 16);
+
+        for (field, snapshot) in [
+            (
+                "world_seed",
+                serde_json::json!({ "tick": 7, "actor_id": 99 }),
+            ),
+            (
+                "tick",
+                serde_json::json!({ "world_seed": 42, "actor_id": 99 }),
+            ),
+            (
+                "actor_id",
+                serde_json::json!({ "world_seed": 42, "tick": 7 }),
+            ),
+        ] {
+            assert!(matches!(
+                derive_random_bytes(&snapshot, 1, 16),
+                Err(SandboxError::MissingHostRandomField(missing)) if missing == field
+            ));
+        }
+    }
+
     #[test]
     fn rejects_module_larger_than_5mb() {
         let bytes = vec![0; MAX_MODULE_BYTES + 1];
@@ -2041,15 +2278,51 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_includes_wasm_hash_and_wasmtime_version() {
+    fn cache_key_includes_wasm_hash_wasmtime_version_and_validation_policy() {
         let wasm = valid_echo_module();
         let key = ModuleCacheKey::for_wasm(&wasm);
         assert_eq!(key.module_hash, wasm_hash(&wasm));
         assert_eq!(key.wasmtime_version, wasmtime_version());
+        assert_eq!(
+            key.validation_policy_version,
+            DEFAULT_VALIDATION_POLICY_VERSION
+        );
 
         let other_version = ModuleCacheKey::for_wasm_with_version(&wasm, "wasmtime-next");
         assert_eq!(other_version.module_hash, key.module_hash);
         assert_ne!(other_version.wasmtime_version, key.wasmtime_version);
+
+        let other_policy = ModuleCacheKey::for_wasm_with_policy(&wasm, "policy-v2");
+        assert_eq!(other_policy.module_hash, key.module_hash);
+        assert_eq!(other_policy.wasmtime_version, key.wasmtime_version);
+        assert_ne!(
+            other_policy.validation_policy_version,
+            key.validation_policy_version
+        );
+    }
+
+    #[test]
+    fn compile_cache_isolated_by_validation_policy_version() {
+        let runtime = SandboxRuntime::default();
+        let wasm = valid_echo_module();
+        let mut cache = CompiledModuleCache::new();
+
+        let first = runtime
+            .compile_cached_with_policy(&mut cache, &wasm, "policy-v1")
+            .unwrap();
+        let second = runtime
+            .compile_cached_with_policy(&mut cache, &wasm, "policy-v2")
+            .unwrap();
+        let first_again = runtime
+            .compile_cached_with_policy(&mut cache, &wasm, "policy-v1")
+            .unwrap();
+
+        assert_eq!(first.validation_policy_version(), "policy-v1");
+        assert_eq!(second.validation_policy_version(), "policy-v2");
+        assert_eq!(first_again.validation_policy_version(), "policy-v1");
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[test]
@@ -2183,7 +2456,7 @@ mod tests {
         );
         let runtime = SandboxRuntime::new(SandboxConfig {
             max_path_find_per_tick: 1,
-            ..SandboxConfig::default()
+            ..SandboxConfig::development()
         })
         .unwrap();
         let module = runtime.compile(&bytes).unwrap();
