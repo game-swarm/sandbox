@@ -4,7 +4,10 @@ use std::{
     fs::OpenOptions,
     io::{ErrorKind, Write},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +26,13 @@ use swarm_wasm_sandbox::{
     CompiledModule, CompiledModuleCache, HostCallBudget, IsolationMode, OsIsolationPolicy,
     SandboxConfig, SandboxRuntime,
 };
-use tokio::{signal, sync::Mutex, time};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    signal,
+    sync::Mutex,
+    time,
+};
 use uuid::Uuid;
 
 const DEPLOY_SCHEMA: &str = "swarm.sandbox.deploy.v1";
@@ -32,8 +41,10 @@ const MODULE_FETCH_SCHEMA: &str = "swarm.sandbox.module-fetch.v1";
 const AUTH_FRESHNESS_MS: u64 = 60_000;
 const AUTH_FUTURE_SKEW_MS: u64 = 5_000;
 const DEFAULT_NATS_CONNECT_RETRY_MS: u64 = 1_000;
+const DEFAULT_SANDBOX_HEALTH_ADDR: &str = "127.0.0.1:8083";
 const NONCE_STORE_FILE_NAME: &str = "nonces.db";
 const NONCE_STORE_DIR_NAME: &str = "swarm-sandbox";
+const JSON_CONTENT_TYPE: &str = "application/json";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -131,6 +142,27 @@ struct ServiceState {
     nonce_store: DurableNonceStore,
     sandbox_config: SandboxConfig,
     started_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ReadinessState {
+    tick_subscribed: AtomicBool,
+    deploy_subscribed: AtomicBool,
+}
+
+impl ReadinessState {
+    fn set_tick_subscribed(&self, ready: bool) {
+        self.tick_subscribed.store(ready, Ordering::Relaxed);
+    }
+
+    fn set_deploy_subscribed(&self, ready: bool) {
+        self.deploy_subscribed.store(ready, Ordering::Relaxed);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.tick_subscribed.load(Ordering::Relaxed)
+            && self.deploy_subscribed.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -278,6 +310,10 @@ fn lock_nonce_store(path: &Path) -> Result<fs::File, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let instance_id = env::var("INSTANCE_ID").unwrap_or_else(|_| default_instance_id());
     let retry_delay = nats_connect_retry_delay();
+    let health_addr =
+        configured_sandbox_health_addr(env::var("SANDBOX_HEALTH_ADDR").ok().as_deref());
+    let readiness = Arc::new(ReadinessState::default());
+    tokio::spawn(readiness_server(health_addr, Arc::clone(&readiness)));
     let sandbox_config = startup_sandbox_config().map_err(std::io::Error::other)?;
     let nonce_store_path = sandbox_nonce_store_path().map_err(std::io::Error::other)?;
     let nats_config = NatsConfig::from_env().map_err(std::io::Error::other)?;
@@ -300,14 +336,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await?;
     let deploy_sub = client.subscribe("swarm.deploy.*".to_string()).await?;
+    readiness.set_tick_subscribed(true);
+    readiness.set_deploy_subscribed(true);
 
-    let tick_task = tokio::spawn(handle_ticks(client.clone(), Arc::clone(&state), tick_sub));
-    let deploy_task = tokio::spawn(handle_deploys(
-        client.clone(),
-        Arc::clone(&state),
-        instance_id.clone(),
-        deploy_sub,
-    ));
+    let tick_readiness = Arc::clone(&readiness);
+    let tick_client = client.clone();
+    let tick_state = Arc::clone(&state);
+    let tick_task = tokio::spawn(async move {
+        handle_ticks(tick_client, tick_state, tick_sub).await;
+        tick_readiness.set_tick_subscribed(false);
+    });
+    let deploy_readiness = Arc::clone(&readiness);
+    let deploy_state = Arc::clone(&state);
+    let deploy_client = client.clone();
+    let deploy_instance_id = instance_id.clone();
+    let deploy_task = tokio::spawn(async move {
+        handle_deploys(deploy_client, deploy_state, deploy_instance_id, deploy_sub).await;
+        deploy_readiness.set_deploy_subscribed(false);
+    });
     let heartbeat_task = tokio::spawn(heartbeat(
         client.clone(),
         Arc::clone(&state),
@@ -320,6 +366,126 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     heartbeat_task.abort();
     client.drain().await?;
     Ok(())
+}
+
+fn configured_sandbox_health_addr(value: Option<&str>) -> String {
+    value.unwrap_or(DEFAULT_SANDBOX_HEALTH_ADDR).to_string()
+}
+
+async fn readiness_server(addr: String, readiness: Arc<ReadinessState>) {
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("sandbox health server bind failed addr={addr} error={error}");
+            return;
+        }
+    };
+    println!("sandbox health server listening addr={addr}");
+
+    serve_readiness(listener, readiness).await;
+}
+
+async fn serve_readiness(listener: TcpListener, readiness: Arc<ReadinessState>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let readiness = Arc::clone(&readiness);
+                tokio::spawn(async move {
+                    respond_readiness_http(stream, readiness).await;
+                });
+            }
+            Err(error) => eprintln!("sandbox health server connection failed error={error}"),
+        }
+    }
+}
+
+async fn respond_readiness_http(mut stream: TcpStream, readiness: Arc<ReadinessState>) {
+    let mut buffer = [0_u8; 1024];
+    let Ok(bytes_read) = stream.read(&mut buffer).await else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let Some(request_line) = request.lines().next() else {
+        let _ = write_http_response(
+            &mut stream,
+            "HTTP/1.1 400 Bad Request",
+            "text/plain; charset=utf-8",
+            b"bad request\n",
+        )
+        .await;
+        return;
+    };
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+
+    if !method.eq_ignore_ascii_case("GET") {
+        let _ = write_http_response(
+            &mut stream,
+            "HTTP/1.1 405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"method not allowed\n",
+        )
+        .await;
+        return;
+    }
+
+    match path {
+        "/" | "/healthz" | "/readyz" => {
+            let (status_line, body) = render_readiness_body(&readiness);
+            let _ =
+                write_http_response(&mut stream, status_line, JSON_CONTENT_TYPE, body.as_bytes())
+                    .await;
+        }
+        _ => {
+            let _ = write_http_response(
+                &mut stream,
+                "HTTP/1.1 404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found\n",
+            )
+            .await;
+        }
+    }
+}
+
+fn render_readiness_body(readiness: &ReadinessState) -> (&'static str, String) {
+    let tick_ready = readiness.tick_subscribed.load(Ordering::Relaxed);
+    let deploy_ready = readiness.deploy_subscribed.load(Ordering::Relaxed);
+    let ready = readiness.is_ready();
+    let status = if ready { "ok" } else { "degraded" };
+    let nats = if ready { "ready" } else { "unavailable" };
+    let tick = if tick_ready { "ready" } else { "unavailable" };
+    let deploy = if deploy_ready { "ready" } else { "unavailable" };
+    let status_line = if ready {
+        "HTTP/1.1 200 OK"
+    } else {
+        "HTTP/1.1 503 Service Unavailable"
+    };
+    let body = json!({
+        "status": status,
+        "nats": nats,
+        "subscriptions": {
+            "tick": tick,
+            "deploy": deploy,
+        }
+    })
+    .to_string();
+    (status_line, format!("{body}\n"))
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status_line: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "{status_line}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body).await
 }
 
 async fn connect_nats_with_retry(
@@ -1723,6 +1889,86 @@ mod tests {
             connect_retry_delay_from_env(None),
             Duration::from_millis(DEFAULT_NATS_CONNECT_RETRY_MS)
         );
+    }
+
+    #[test]
+    fn sandbox_health_addr_defaults_to_loopback() {
+        assert_eq!(
+            configured_sandbox_health_addr(None),
+            DEFAULT_SANDBOX_HEALTH_ADDR
+        );
+        assert_eq!(
+            configured_sandbox_health_addr(Some("0.0.0.0:9000")),
+            "0.0.0.0:9000"
+        );
+    }
+
+    #[test]
+    fn readiness_body_reports_degraded_until_all_subscriptions_ready() {
+        let readiness = ReadinessState::default();
+
+        let (status, degraded_body) = render_readiness_body(&readiness);
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+        assert!(degraded_body.contains(r#""status":"degraded""#));
+        assert!(degraded_body.contains(r#""nats":"unavailable""#));
+
+        readiness.set_tick_subscribed(true);
+        let (status, partially_ready_body) = render_readiness_body(&readiness);
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+        assert!(partially_ready_body.contains(r#""tick":"ready""#));
+        assert!(partially_ready_body.contains(r#""deploy":"unavailable""#));
+
+        readiness.set_deploy_subscribed(true);
+        let (status, ready_body) = render_readiness_body(&readiness);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(ready_body.contains(r#""status":"ok""#));
+        assert!(ready_body.contains(r#""nats":"ready""#));
+        assert!(ready_body.len() < 512);
+    }
+
+    #[tokio::test]
+    async fn readiness_endpoint_returns_503_then_200_from_subscription_state() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let readiness = Arc::new(ReadinessState::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(serve_readiness(listener, Arc::clone(&readiness)));
+
+        let degraded = http_get(addr, "/healthz").await;
+        assert!(degraded.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(degraded.contains(r#""status":"degraded""#));
+
+        readiness.set_tick_subscribed(true);
+        readiness.set_deploy_subscribed(true);
+        let ready = http_get(addr, "/readyz").await;
+        assert!(ready.starts_with("HTTP/1.1 200 OK"));
+        assert!(ready.contains(r#""status":"ok""#));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"POST /readyz HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        let response = String::from_utf8(bytes).unwrap();
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+
+        handle.abort();
+    }
+
+    async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
     }
 
     #[test]
