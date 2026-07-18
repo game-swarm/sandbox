@@ -18,7 +18,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::MetadataExt;
 
 use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
