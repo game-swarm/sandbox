@@ -1,7 +1,7 @@
 FROM rust:1-trixie AS build
 WORKDIR /app
 COPY . .
-RUN cargo build --release --locked --bin swarm-sandbox
+RUN cargo build --release --locked --bin swarm-sandbox --features os-cgroup,os-network-namespace,os-readonly-root,os-seccomp,os-tmpfs
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
