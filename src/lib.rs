@@ -2,14 +2,22 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use swarm_engine_api::abi::{
+    HostFuelRemainingRequest, HostFuelRemainingResponse, HostObjectsInRangeRequest,
+    HostObjectsInRangeResponse, HostPathFindRequest, HostPathFindResponse, HostPayload,
+    HostRandomRequest, HostRandomResponse, HostResult, HostTerrainRequest, HostTerrainResponse,
+    HostWorldConfigRequest, HostWorldConfigResponse, HostWorldRulesRequest, HostWorldRulesResponse,
+    SnapshotPosition, SnapshotTerrain, SwarmDecode, SwarmEncode, TickInput, VisibleSnapshot,
+    decode_swarm_payload, decode_tick_input_with_snapshot, decode_tick_result, encode_host_result,
+};
 use thiserror::Error;
 use wasmparser::{Parser, Payload};
 use wasmtime::{
     AsContextMut, Caller, Config, Engine, ExternType, Linker, Memory, Module, OptLevel, Store,
-    StoreLimits, StoreLimitsBuilder, TypedFunc,
+    StoreLimits, StoreLimitsBuilder, TypedFunc, ValType,
 };
 
-pub const DEFAULT_VALIDATION_POLICY_VERSION: &str = "raw-wasm-v1";
+pub const DEFAULT_VALIDATION_POLICY_VERSION: &str = "raw-wasm-v2";
 
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
 use std::io::{Read, Write};
@@ -21,7 +29,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const MAX_MODULE_BYTES: usize = 5 * 1024 * 1024;
-pub const MAX_OUTPUT_JSON_BYTES: usize = 256 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const MAX_WASM_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_WASM_MEMORY_PAGES: u32 = (MAX_WASM_MEMORY_BYTES / 65_536) as u32;
 pub const MAX_FUEL: u64 = 10_000_000;
@@ -35,13 +43,12 @@ pub const DEFAULT_RANDOM_PER_TICK: u32 = 10;
 pub const DEFAULT_TICK_TIMEOUT_MS: u64 = 2_500;
 pub const MAX_RANDOM_BYTES: i32 = 256;
 
-const RESULT_STRUCT_BYTES: i32 = 16;
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
 const CHILD_ENV: &str = "SWARM_WASM_SANDBOX_CHILD";
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
 const PROTOCOL_MAGIC: u32 = 0x5357_5342;
 #[cfg(all(feature = "os-isolation", target_os = "linux"))]
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const ALLOWED_IMPORTS: &[(&str, &str)] = &[
     ("env", "host_get_terrain"),
     ("env", "host_get_objects_in_range"),
@@ -59,7 +66,7 @@ pub struct SandboxConfig {
     pub max_host_calls_per_tick: u32,
     pub max_path_find_per_tick: u32,
     pub max_objects_in_range_per_tick: u32,
-    pub max_output_json_bytes: usize,
+    pub max_output_bytes: usize,
     pub tick_timeout_ms: u64,
     pub wasm_simd: bool,
     pub isolation: IsolationMode,
@@ -103,7 +110,7 @@ impl Default for SandboxConfig {
             max_host_calls_per_tick: DEFAULT_HOST_CALLS_PER_TICK,
             max_path_find_per_tick: DEFAULT_PATH_FIND_PER_TICK,
             max_objects_in_range_per_tick: DEFAULT_OBJECTS_IN_RANGE_PER_TICK,
-            max_output_json_bytes: MAX_OUTPUT_JSON_BYTES,
+            max_output_bytes: MAX_OUTPUT_BYTES,
             tick_timeout_ms: DEFAULT_TICK_TIMEOUT_MS,
             wasm_simd: false,
             isolation: IsolationMode::OsProcess,
@@ -149,8 +156,7 @@ pub struct HostCallBudget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickOutput {
-    pub command_json: Vec<u8>,
-    pub messages: Vec<u8>,
+    pub tick_result_bytes: Vec<u8>,
     pub host_call_budget: HostCallBudget,
 }
 
@@ -196,8 +202,12 @@ pub enum SandboxError {
     },
     #[error("tick returned non-zero status {0}")]
     TickFailed(i32),
-    #[error("output JSON exceeds 256KB limit: {actual} bytes")]
+    #[error("tick result exceeds 256KB limit: {actual} bytes")]
     OutputTooLarge { actual: usize },
+    #[error("tick result is not canonical ABI v2 bytes")]
+    InvalidTickResultAbi,
+    #[error("tick input or visible snapshot is not canonical ABI v2 bytes")]
+    InvalidTickInputAbi,
     #[error("host call budget exceeded")]
     HostCallBudgetExceeded,
     #[error("OS process isolation is unavailable on this build/target")]
@@ -233,6 +243,8 @@ impl SandboxError {
             | SandboxError::MissingHostRandomField(_)
             | SandboxError::TickFailed(_)
             | SandboxError::OutputTooLarge { .. }
+            | SandboxError::InvalidTickResultAbi
+            | SandboxError::InvalidTickInputAbi
             | SandboxError::OsIsolationProtocol(_) => -5,
             SandboxError::OsIsolationTimedOut { .. } => -7,
             SandboxError::OsIsolationUnavailable => -9,
@@ -422,7 +434,8 @@ struct StoreState {
     limits: StoreLimits,
     host_budget: HostCallBudget,
     config: SandboxConfig,
-    snapshot: serde_json::Value,
+    tick_input: TickInput,
+    snapshot: VisibleSnapshot,
 }
 
 impl SandboxRuntime {
@@ -609,19 +622,21 @@ impl SandboxRuntime {
     pub fn execute_tick(
         &self,
         compiled: &CompiledModule,
-        snapshot_json: &[u8],
+        tick_input_bytes: &[u8],
     ) -> Result<TickOutput, SandboxError> {
         match self.config.isolation {
-            IsolationMode::InProcess => self.execute_tick_in_process(compiled, snapshot_json),
-            IsolationMode::OsProcess => self.execute_tick_os_process(compiled, snapshot_json),
+            IsolationMode::InProcess => self.execute_tick_in_process(compiled, tick_input_bytes),
+            IsolationMode::OsProcess => self.execute_tick_os_process(compiled, tick_input_bytes),
         }
     }
 
     fn execute_tick_in_process(
         &self,
         compiled: &CompiledModule,
-        snapshot_json: &[u8],
+        tick_input_bytes: &[u8],
     ) -> Result<TickOutput, SandboxError> {
+        let (tick_input, snapshot) = decode_tick_input_with_snapshot(tick_input_bytes)
+            .map_err(|_| SandboxError::InvalidTickInputAbi)?;
         let mut store = Store::new(
             &self.engine,
             StoreState {
@@ -633,7 +648,8 @@ impl SandboxRuntime {
                     .build(),
                 host_budget: HostCallBudget::default(),
                 config: self.config.clone(),
-                snapshot: serde_json::from_slice(snapshot_json).unwrap_or(serde_json::Value::Null),
+                tick_input,
+                snapshot,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -649,77 +665,47 @@ impl SandboxRuntime {
             .ok_or(SandboxError::MissingMemory)?;
         let alloc: TypedFunc<i32, i32> = instance.get_typed_func(&mut store, "alloc")?;
         let free: TypedFunc<(i32, i32), ()> = instance.get_typed_func(&mut store, "free")?;
-        let tick: TypedFunc<(i32, i32, i32), i32> = instance.get_typed_func(&mut store, "tick")?;
+        let tick: TypedFunc<(i32, i32, i32, i32), i32> =
+            instance.get_typed_func(&mut store, "tick")?;
 
-        let snapshot_len = usize_to_i32(snapshot_json.len())?;
-        let snapshot_ptr = alloc.call(&mut store, snapshot_len)?;
-        checked_range(memory, &mut store, snapshot_ptr, snapshot_len)?;
+        let input_len = usize_to_i32(tick_input_bytes.len())?;
+        let input_ptr = alloc.call(&mut store, input_len)?;
+        checked_range(memory, &mut store, input_ptr, input_len)?;
         memory
-            .write(&mut store, snapshot_ptr as usize, snapshot_json)
+            .write(&mut store, input_ptr as usize, tick_input_bytes)
             .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
 
-        let result_ptr = alloc.call(&mut store, RESULT_STRUCT_BYTES)?;
-        let result_range = checked_range(memory, &mut store, result_ptr, RESULT_STRUCT_BYTES)?;
-        ensure_aligned(result_range.start, 4)?;
+        let output_capacity = usize_to_i32(self.config.max_output_bytes)?;
+        let output_ptr = alloc.call(&mut store, output_capacity)?;
+        checked_range(memory, &mut store, output_ptr, output_capacity)?;
 
-        let tick_status = tick.call(&mut store, (snapshot_ptr, snapshot_len, result_ptr))?;
-        if tick_status != 0 {
-            let _ = free.call(&mut store, (snapshot_ptr, snapshot_len));
-            let _ = free.call(&mut store, (result_ptr, RESULT_STRUCT_BYTES));
-            return Err(SandboxError::TickFailed(tick_status));
+        let output_status = tick.call(
+            &mut store,
+            (input_ptr, input_len, output_ptr, output_capacity),
+        )?;
+        if output_status < 0 {
+            let _ = free.call(&mut store, (input_ptr, input_len));
+            let _ = free.call(&mut store, (output_ptr, output_capacity));
+            return Err(SandboxError::TickFailed(output_status));
+        }
+        let output_len = output_status as usize;
+        if output_len > self.config.max_output_bytes {
+            let _ = free.call(&mut store, (input_ptr, input_len));
+            let _ = free.call(&mut store, (output_ptr, output_capacity));
+            return Err(SandboxError::OutputTooLarge { actual: output_len });
         }
 
-        let mut result = [0_u8; RESULT_STRUCT_BYTES as usize];
+        let output_range = checked_range(memory, &mut store, output_ptr, output_len as i32)?;
+        let mut tick_result_bytes = vec![0_u8; output_len];
         memory
-            .read(&mut store, result_range.start, &mut result)
+            .read(&mut store, output_range.start, &mut tick_result_bytes)
             .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
-        let output_ptr = u32::from_le_bytes(result[0..4].try_into().expect("slice length"));
-        let output_len = u32::from_le_bytes(result[4..8].try_into().expect("slice length"));
-        let message_ptr = u32::from_le_bytes(result[8..12].try_into().expect("slice length"));
-        let message_len = u32::from_le_bytes(result[12..16].try_into().expect("slice length"));
-        let total_output_len = output_len as usize + message_len as usize;
-        if total_output_len > self.config.max_output_json_bytes {
-            if output_len != 0 {
-                let _ = free.call(&mut store, (output_ptr as i32, output_len as i32));
-            }
-            if message_len != 0 {
-                let _ = free.call(&mut store, (message_ptr as i32, message_len as i32));
-            }
-            let _ = free.call(&mut store, (snapshot_ptr, snapshot_len));
-            let _ = free.call(&mut store, (result_ptr, RESULT_STRUCT_BYTES));
-            return Err(SandboxError::OutputTooLarge {
-                actual: total_output_len,
-            });
-        }
-
-        let output_range = checked_u32_range(memory, &mut store, output_ptr, output_len)?;
-        let mut command_json = vec![0_u8; output_len as usize];
-        memory
-            .read(&mut store, output_range.start, &mut command_json)
-            .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
-        let messages = if message_len == 0 {
-            Vec::new()
-        } else {
-            let message_range = checked_u32_range(memory, &mut store, message_ptr, message_len)?;
-            let mut messages = vec![0_u8; message_len as usize];
-            memory
-                .read(&mut store, message_range.start, &mut messages)
-                .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
-            messages
-        };
-
-        if output_len != 0 {
-            free.call(&mut store, (output_ptr as i32, output_len as i32))?;
-        }
-        if message_len != 0 {
-            free.call(&mut store, (message_ptr as i32, message_len as i32))?;
-        }
-        free.call(&mut store, (snapshot_ptr, snapshot_len))?;
-        free.call(&mut store, (result_ptr, RESULT_STRUCT_BYTES))?;
+        decode_tick_result(&tick_result_bytes).map_err(|_| SandboxError::InvalidTickResultAbi)?;
+        free.call(&mut store, (input_ptr, input_len))?;
+        free.call(&mut store, (output_ptr, output_capacity))?;
 
         Ok(TickOutput {
-            command_json,
-            messages,
+            tick_result_bytes,
             host_call_budget: store.data().host_budget.clone(),
         })
     }
@@ -728,16 +714,20 @@ impl SandboxRuntime {
     fn execute_tick_os_process(
         &self,
         compiled: &CompiledModule,
-        snapshot_json: &[u8],
+        tick_input_bytes: &[u8],
     ) -> Result<TickOutput, SandboxError> {
-        linux_os_isolation::execute_tick(self.config.clone(), &compiled.wasm_bytes, snapshot_json)
+        linux_os_isolation::execute_tick(
+            self.config.clone(),
+            &compiled.wasm_bytes,
+            tick_input_bytes,
+        )
     }
 
     #[cfg(not(all(feature = "os-isolation", target_os = "linux")))]
     fn execute_tick_os_process(
         &self,
         _compiled: &CompiledModule,
-        _snapshot_json: &[u8],
+        _tick_input_bytes: &[u8],
     ) -> Result<TickOutput, SandboxError> {
         Err(SandboxError::OsIsolationUnavailable)
     }
@@ -777,23 +767,58 @@ pub fn validate_wasmparser(wasm_bytes: &[u8]) -> Result<(), SandboxError> {
 }
 
 fn validate_module_exports(module: &Module) -> Result<(), SandboxError> {
-    require_func_export(module, "tick")?;
-    require_func_export(module, "alloc")?;
-    require_func_export(module, "free")?;
+    require_func_signature(
+        module,
+        "tick",
+        &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        &[ValType::I32],
+        "(i32, i32, i32, i32) -> i32",
+    )?;
+    require_func_signature(
+        module,
+        "alloc",
+        &[ValType::I32],
+        &[ValType::I32],
+        "(i32) -> i32",
+    )?;
+    require_func_signature(
+        module,
+        "free",
+        &[ValType::I32, ValType::I32],
+        &[],
+        "(i32, i32) -> ()",
+    )?;
     Ok(())
 }
 
-fn require_func_export(module: &Module, name: &'static str) -> Result<(), SandboxError> {
+fn require_func_signature(
+    module: &Module,
+    name: &'static str,
+    params: &[ValType],
+    results: &[ValType],
+    expected: &'static str,
+) -> Result<(), SandboxError> {
     match module
         .get_export(name)
         .ok_or(SandboxError::MissingExport(name))?
     {
-        ExternType::Func(_) => Ok(()),
-        _ => Err(SandboxError::WrongExportType {
-            name,
-            expected: "function",
-        }),
+        ExternType::Func(function)
+            if val_types_match(function.params(), params)
+                && val_types_match(function.results(), results) =>
+        {
+            Ok(())
+        }
+        _ => Err(SandboxError::WrongExportType { name, expected }),
     }
+}
+
+fn val_types_match(actual: impl Iterator<Item = ValType>, expected: &[ValType]) -> bool {
+    let actual = actual.collect::<Vec<_>>();
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.to_string() == expected.to_string())
 }
 
 fn validate_module_imports(module: &Module) -> Result<(), SandboxError> {
@@ -820,8 +845,9 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
         "host_get_terrain",
         |mut caller: Caller<'_, StoreState>, room_id: u32, out_ptr: i32, out_len: i32| -> i32 {
             match charge_host_call(&mut caller, HostCallKind::Terrain).and_then(|_| {
-                let payload = terrain_payload(caller.data().snapshot(), room_id);
-                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+                let request = HostTerrainRequest { room_id };
+                let payload = terrain_payload(caller.data().snapshot(), request.room_id);
+                write_host_result_to_guest(&mut caller, out_ptr, out_len, payload)
             }) {
                 Ok(bytes) => bytes,
                 Err(err) => err.abi_error_code(),
@@ -842,8 +868,18 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
                 return SandboxError::NegativePointer.abi_error_code();
             }
             match charge_host_call(&mut caller, HostCallKind::ObjectsInRange).and_then(|_| {
-                let payload = objects_in_range(caller.data().snapshot(), x, y, range);
-                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+                let request = HostObjectsInRangeRequest {
+                    x,
+                    y,
+                    range: range as u32,
+                };
+                let payload = objects_in_range(
+                    caller.data().snapshot(),
+                    request.x,
+                    request.y,
+                    request.range as i32,
+                );
+                write_host_result_to_guest(&mut caller, out_ptr, out_len, payload)
             }) {
                 Ok(bytes) => bytes,
                 Err(err) => err.abi_error_code(),
@@ -864,9 +900,31 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
          out_len: i32|
          -> i32 {
             match charge_host_call(&mut caller, HostCallKind::PathFind).and_then(|_| {
-                let _opts = read_guest_bytes(&mut caller, opts_ptr, opts_len)?;
-                let payload = path_find(caller.data().snapshot(), from_x, from_y, to_x, to_y);
-                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+                let request = if opts_len == 0 {
+                    HostPathFindRequest {
+                        from_x,
+                        from_y,
+                        to_x,
+                        to_y,
+                        max_path_length: 500,
+                    }
+                } else {
+                    read_host_request::<HostPathFindRequest>(
+                        &mut caller,
+                        opts_ptr,
+                        opts_len,
+                        "HostPathFindRequest",
+                    )?
+                };
+                if (request.from_x, request.from_y, request.to_x, request.to_y)
+                    != (from_x, from_y, to_x, to_y)
+                {
+                    return Err(SandboxError::MemoryAccess(
+                        "host_path_find request coordinates do not match ABI arguments".into(),
+                    ));
+                }
+                let payload = path_find(caller.data().snapshot(), request);
+                write_host_result_to_guest(&mut caller, out_ptr, out_len, payload)
             }) {
                 Ok(bytes) => bytes,
                 Err(err) => err.abi_error_code(),
@@ -883,9 +941,18 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
          out_len: i32|
          -> i32 {
             match charge_host_call(&mut caller, HostCallKind::WorldConfig).and_then(|_| {
-                let key = read_guest_string(&mut caller, key_ptr, key_len)?;
-                let payload = world_config_lookup(caller.data().snapshot(), &key);
-                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+                let request = if key_len == 0 {
+                    HostWorldConfigRequest { key: String::new() }
+                } else {
+                    read_host_request::<HostWorldConfigRequest>(
+                        &mut caller,
+                        key_ptr,
+                        key_len,
+                        "HostWorldConfigRequest",
+                    )?
+                };
+                let payload = world_config_lookup(caller.data(), &request.key);
+                write_host_result_to_guest(&mut caller, out_ptr, out_len, payload)
             }) {
                 Ok(bytes) => bytes,
                 Err(err) => err.abi_error_code(),
@@ -902,9 +969,20 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
          out_len: i32|
          -> i32 {
             match charge_host_call(&mut caller, HostCallKind::WorldRules).and_then(|_| {
-                let rule_id = read_guest_string(&mut caller, rule_id_ptr, rule_id_len)?;
-                let payload = world_rules(caller.data().snapshot(), &rule_id);
-                write_json_to_guest(&mut caller, out_ptr, out_len, &payload)
+                let request = if rule_id_len == 0 {
+                    HostWorldRulesRequest {
+                        rule_id: String::new(),
+                    }
+                } else {
+                    read_host_request::<HostWorldRulesRequest>(
+                        &mut caller,
+                        rule_id_ptr,
+                        rule_id_len,
+                        "HostWorldRulesRequest",
+                    )?
+                };
+                let payload = world_rules(caller.data(), &request.rule_id);
+                write_host_result_to_guest(&mut caller, out_ptr, out_len, payload)
             }) {
                 Ok(bytes) => bytes,
                 Err(err) => err.abi_error_code(),
@@ -915,17 +993,25 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
         "env",
         "host_get_random",
         |mut caller: Caller<'_, StoreState>, sequence: u64, out_ptr: i32, out_len: i32| -> i32 {
-            if out_len > MAX_RANDOM_BYTES {
-                return SandboxError::MemoryOutOfBounds {
-                    ptr: out_ptr as u32,
-                    len: out_len as u32,
-                    memory_len: MAX_RANDOM_BYTES as usize,
-                }
-                .abi_error_code();
-            }
             match charge_host_call(&mut caller, HostCallKind::Random).and_then(|_| {
-                let bytes = derive_random_bytes(caller.data().snapshot(), sequence, out_len)?;
-                write_bytes_to_guest(&mut caller, out_ptr, out_len, &bytes)
+                let payload_capacity = out_len
+                    .saturating_sub(14)
+                    .min(MAX_RANDOM_BYTES.saturating_sub(4));
+                let request = HostRandomRequest {
+                    sequence,
+                    length: payload_capacity as u32,
+                };
+                let bytes = derive_random_bytes(
+                    caller.data().snapshot(),
+                    request.sequence,
+                    request.length as i32,
+                )?;
+                write_host_result_to_guest(
+                    &mut caller,
+                    out_ptr,
+                    out_len,
+                    HostRandomResponse { bytes },
+                )
             }) {
                 Ok(bytes) => bytes,
                 Err(err) => err.abi_error_code(),
@@ -936,10 +1022,14 @@ fn define_read_only_host_imports(linker: &mut Linker<StoreState>) -> Result<(), 
         "env",
         "host_get_fuel_remaining",
         |mut caller: Caller<'_, StoreState>| -> u64 {
+            let _request = HostFuelRemainingRequest;
             if charge_host_call(&mut caller, HostCallKind::FuelRemaining).is_err() {
                 return 0;
             }
-            caller.get_fuel().unwrap_or(0)
+            HostFuelRemainingResponse {
+                fuel_remaining: caller.get_fuel().unwrap_or(0),
+            }
+            .fuel_remaining
         },
     )?;
     Ok(())
@@ -1045,16 +1135,15 @@ fn caller_memory(caller: &mut Caller<'_, StoreState>) -> Result<Memory, SandboxE
         .ok_or(SandboxError::MissingMemory)
 }
 
-fn read_guest_string(
+fn read_host_request<T: SwarmDecode + SwarmEncode>(
     caller: &mut Caller<'_, StoreState>,
     ptr: i32,
     len: i32,
-) -> Result<String, SandboxError> {
-    if len == 0 {
-        return Ok(String::new());
-    }
+    field: &'static str,
+) -> Result<T, SandboxError> {
     let bytes = read_guest_bytes(caller, ptr, len)?;
-    String::from_utf8(bytes).map_err(|err| SandboxError::MemoryAccess(err.to_string()))
+    decode_swarm_payload(&bytes, field, 4 * 1024)
+        .map_err(|err| SandboxError::MemoryAccess(err.to_string()))
 }
 
 fn read_guest_bytes(
@@ -1071,14 +1160,14 @@ fn read_guest_bytes(
     Ok(bytes)
 }
 
-fn write_json_to_guest(
+fn write_host_result_to_guest<T: HostPayload>(
     caller: &mut Caller<'_, StoreState>,
     out_ptr: i32,
     out_len: i32,
-    value: &serde_json::Value,
+    payload: T,
 ) -> Result<i32, SandboxError> {
-    let bytes =
-        serde_json::to_vec(value).map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
+    let bytes = encode_host_result(&HostResult::success(payload))
+        .map_err(|err| SandboxError::MemoryAccess(err.to_string()))?;
     write_bytes_to_guest(caller, out_ptr, out_len, &bytes)
 }
 
@@ -1103,90 +1192,69 @@ fn write_bytes_to_guest(
     usize_to_i32(bytes.len())
 }
 
-fn terrain_payload(snapshot: &serde_json::Value, room_id: u32) -> serde_json::Value {
-    let room = snapshot.get("room").unwrap_or(snapshot);
-    serde_json::json!({
-        "room_id": room_id,
-        "terrain": room.get("terrain").cloned().unwrap_or(serde_json::Value::Null),
-    })
+fn terrain_payload(snapshot: &VisibleSnapshot, room_id: u32) -> HostTerrainResponse {
+    HostTerrainResponse {
+        room_id,
+        terrain: snapshot
+            .terrain
+            .iter()
+            .filter(|tile| tile.room_id == room_id)
+            .copied()
+            .collect(),
+    }
 }
 
 impl StoreState {
-    fn snapshot(&self) -> &serde_json::Value {
+    fn snapshot(&self) -> &VisibleSnapshot {
         &self.snapshot
     }
 }
 
-fn terrain_at(snapshot: &serde_json::Value, x: i32, y: i32) -> Option<&str> {
+fn terrain_at(snapshot: &VisibleSnapshot, x: i32, y: i32) -> Option<SnapshotTerrain> {
     snapshot
-        .get("visible_tiles")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|tiles| {
-            tiles.iter().find_map(|tile| {
-                (json_i32(tile.get("x"))? == x && json_i32(tile.get("y"))? == y)
-                    .then(|| tile.get("terrain")?.as_str())
-                    .flatten()
-            })
-        })
-        .or_else(|| {
-            snapshot
-                .get("room")
-                .and_then(|room| room.get("terrain"))
-                .and_then(|terrain| terrain.get(y as usize))
-                .and_then(|row| {
-                    row.as_array()
-                        .and_then(|items| items.get(x as usize))
-                        .and_then(serde_json::Value::as_str)
-                        .or_else(|| {
-                            row.as_str()
-                                .and_then(|line| line.as_bytes().get(x as usize).copied())
-                                .and_then(|byte| match byte {
-                                    b'.' => Some("Plain"),
-                                    b'~' => Some("Swamp"),
-                                    b'#' => Some("Wall"),
-                                    _ => None,
-                                })
-                        })
-                })
-        })
+        .terrain
+        .iter()
+        .find(|tile| tile.x == x && tile.y == y)
+        .map(|tile| tile.terrain)
 }
 
-fn terrain_code(terrain: &str) -> i32 {
-    match terrain {
-        "Plain" | "plain" => 0,
-        "Swamp" | "swamp" => 1,
-        "Wall" | "wall" => 2,
-        _ => -1,
+fn objects_in_range(
+    snapshot: &VisibleSnapshot,
+    x: i32,
+    y: i32,
+    range: i32,
+) -> HostObjectsInRangeResponse {
+    HostObjectsInRangeResponse {
+        objects: snapshot
+            .entities
+            .iter()
+            .filter(|entity| {
+                entity.position.is_some_and(|position| {
+                    hex_distance_axial(x, y, position.x, position.y) <= range
+                })
+            })
+            .cloned()
+            .collect(),
     }
 }
 
-fn objects_in_range(snapshot: &serde_json::Value, x: i32, y: i32, range: i32) -> serde_json::Value {
-    let entities = snapshot
-        .get("entities")
-        .and_then(serde_json::Value::as_array)
-        .map(|entities| {
-            entities
-                .iter()
-                .filter(|entity| {
-                    entity_position(entity)
-                        .is_some_and(|(ex, ey)| hex_distance_axial(x, y, ex, ey) <= range)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    serde_json::Value::Array(entities)
-}
-
-fn path_find(
-    snapshot: &serde_json::Value,
-    from_x: i32,
-    from_y: i32,
-    to_x: i32,
-    to_y: i32,
-) -> serde_json::Value {
+fn path_find(snapshot: &VisibleSnapshot, request: HostPathFindRequest) -> HostPathFindResponse {
+    let HostPathFindRequest {
+        from_x,
+        from_y,
+        to_x,
+        to_y,
+        max_path_length,
+    } = request;
+    let room_id = snapshot.terrain.first().map_or(0, |tile| tile.room_id);
     if from_x == to_x && from_y == to_y {
-        return serde_json::json!([{ "x": from_x, "y": from_y }]);
+        return HostPathFindResponse {
+            path: vec![SnapshotPosition {
+                room_id,
+                x: from_x,
+                y: from_y,
+            }],
+        };
     }
     let mut queue = VecDeque::from([(from_x, from_y)]);
     let mut came_from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
@@ -1200,22 +1268,33 @@ fn path_find(
             if nx == to_x && ny == to_y {
                 let mut path = Vec::new();
                 let mut current = (to_x, to_y);
-                path.push(serde_json::json!({ "x": current.0, "y": current.1 }));
+                path.push(SnapshotPosition {
+                    room_id,
+                    x: current.0,
+                    y: current.1,
+                });
                 while current != (from_x, from_y) {
                     current = came_from[&current];
-                    path.push(serde_json::json!({ "x": current.0, "y": current.1 }));
+                    path.push(SnapshotPosition {
+                        room_id,
+                        x: current.0,
+                        y: current.1,
+                    });
+                    if path.len() >= max_path_length.min(500) as usize {
+                        return HostPathFindResponse { path: Vec::new() };
+                    }
                 }
                 path.reverse();
-                return serde_json::Value::Array(path);
+                return HostPathFindResponse { path };
             }
             queue.push_back((nx, ny));
         }
     }
-    serde_json::Value::Array(Vec::new())
+    HostPathFindResponse { path: Vec::new() }
 }
 
-fn is_passable_snapshot(snapshot: &serde_json::Value, x: i32, y: i32) -> bool {
-    terrain_at(snapshot, x, y).is_some_and(|terrain| terrain_code(terrain) != 2)
+fn is_passable_snapshot(snapshot: &VisibleSnapshot, x: i32, y: i32) -> bool {
+    terrain_at(snapshot, x, y).is_some_and(|terrain| terrain != SnapshotTerrain::Wall)
 }
 
 fn hex_neighbors(x: i32, y: i32) -> [(i32, i32); 6] {
@@ -1236,54 +1315,24 @@ fn hex_distance_axial(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
     dq.max(dr).max(ds)
 }
 
-fn entity_position(entity: &serde_json::Value) -> Option<(i32, i32)> {
-    let position = entity.get("position").or_else(|| {
-        entity
-            .as_object()
-            .and_then(|object| object.values().find_map(|value| value.get("position")))
-    })?;
-    Some((json_i32(position.get("x"))?, json_i32(position.get("y"))?))
-}
-
-fn json_i32(value: Option<&serde_json::Value>) -> Option<i32> {
-    value
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
-}
-
-fn world_config_lookup(snapshot: &serde_json::Value, key: &str) -> serde_json::Value {
-    let config = snapshot
-        .pointer("/world_config/config")
-        .or_else(|| snapshot.get("world_config"))
-        .or_else(|| snapshot.get("config"));
-    if key.trim().is_empty() {
-        return config.cloned().unwrap_or(serde_json::Value::Null);
+fn world_config_lookup(state: &StoreState, key: &str) -> HostWorldConfigResponse {
+    HostWorldConfigResponse {
+        value: key
+            .is_empty()
+            .then(|| state.tick_input.world_config_view.payload.clone()),
     }
-    config
-        .and_then(|config| config.get(key))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null)
 }
 
-fn world_rules(snapshot: &serde_json::Value, rule_id: &str) -> serde_json::Value {
-    let rules = serde_json::json!({
-        "ruleset": "snapshot",
-        "room_size": snapshot.get("room").and_then(|room| room.get("size")).cloned().unwrap_or(serde_json::json!(50)),
-        "visibility_radius": snapshot.get("visibility_radius").cloned().unwrap_or(serde_json::json!(0)),
-        "snapshot_tick": snapshot.get("tick").cloned().unwrap_or(serde_json::Value::Null),
-        "active_mods": snapshot.pointer("/world_config/config/custom_actions").cloned().unwrap_or(serde_json::json!([])),
-    });
-    if rule_id.trim().is_empty() {
-        return rules;
+fn world_rules(state: &StoreState, rule_id: &str) -> HostWorldRulesResponse {
+    HostWorldRulesResponse {
+        value: rule_id
+            .is_empty()
+            .then(|| state.tick_input.world_config_view.payload.clone()),
     }
-    rules
-        .get(rule_id)
-        .cloned()
-        .unwrap_or(serde_json::Value::Null)
 }
 
 fn derive_random_bytes(
-    snapshot: &serde_json::Value,
+    snapshot: &VisibleSnapshot,
     sequence: u64,
     out_len: i32,
 ) -> Result<Vec<u8>, SandboxError> {
@@ -1298,22 +1347,10 @@ fn derive_random_bytes(
         });
     }
     let mut hasher = blake3::Hasher::new();
-    hash_field(&mut hasher, 1, b"swarm.host_random.v1");
-    hash_field(
-        &mut hasher,
-        2,
-        &required_snapshot_u64(snapshot, "world_seed")?.to_le_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        3,
-        &required_snapshot_u64(snapshot, "tick")?.to_le_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        4,
-        &required_snapshot_u64(snapshot, "actor_id")?.to_le_bytes(),
-    );
+    hash_field(&mut hasher, 1, b"swarm.host_random.v2");
+    hash_field(&mut hasher, 2, &snapshot.world_seed.to_le_bytes());
+    hash_field(&mut hasher, 3, &snapshot.tick.to_le_bytes());
+    hash_field(&mut hasher, 4, &snapshot.actor_id.to_le_bytes());
     hash_field(&mut hasher, 5, &sequence.to_le_bytes());
 
     let mut output = vec![0_u8; out_len as usize];
@@ -1339,20 +1376,6 @@ fn write_uleb128(hasher: &mut blake3::Hasher, mut value: u64) {
             break;
         }
     }
-}
-
-fn required_snapshot_u64(
-    snapshot: &serde_json::Value,
-    key: &'static str,
-) -> Result<u64, SandboxError> {
-    snapshot
-        .get(key)
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-        })
-        .ok_or(SandboxError::MissingHostRandomField(key))
 }
 
 fn checked_range(
@@ -1389,14 +1412,6 @@ fn checked_u32_range(
     Ok(start..end)
 }
 
-fn ensure_aligned(ptr: usize, align: usize) -> Result<(), SandboxError> {
-    if ptr.is_multiple_of(align) {
-        Ok(())
-    } else {
-        Err(SandboxError::PointerOverflow)
-    }
-}
-
 fn usize_to_i32(value: usize) -> Result<i32, SandboxError> {
     i32::try_from(value).map_err(|_| SandboxError::PointerOverflow)
 }
@@ -1424,7 +1439,7 @@ mod linux_os_isolation {
     pub(super) fn execute_tick(
         config: SandboxConfig,
         wasm_bytes: &[u8],
-        snapshot_json: &[u8],
+        tick_input_bytes: &[u8],
     ) -> Result<TickOutput, SandboxError> {
         let current_exe =
             std::env::current_exe().map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?;
@@ -1450,7 +1465,7 @@ mod linux_os_isolation {
             .stdin
             .take()
             .ok_or_else(|| SandboxError::OsIsolationIo("child stdin unavailable".into()))?;
-        write_request(&mut stdin, &config, wasm_bytes, snapshot_json)?;
+        write_request(&mut stdin, &config, wasm_bytes, tick_input_bytes)?;
         drop(stdin);
 
         let deadline = Instant::now() + Duration::from_millis(config.tick_timeout_ms);
@@ -1506,13 +1521,13 @@ mod linux_os_isolation {
         std::io::stdin()
             .read_to_end(&mut input)
             .map_err(|err| SandboxError::OsIsolationIo(err.to_string()))?;
-        let (mut config, wasm_bytes, snapshot_json) = parse_request(&input)?;
+        let (mut config, wasm_bytes, tick_input_bytes) = parse_request(&input)?;
         config.isolation = IsolationMode::InProcess;
         apply_policy(config.os_isolation)?;
 
         let runtime = SandboxRuntime::new(config)?;
         let module = runtime.compile(&wasm_bytes)?;
-        let output = runtime.execute_tick_in_process(&module, &snapshot_json)?;
+        let output = runtime.execute_tick_in_process(&module, &tick_input_bytes)?;
         write_ok_response(&output)
     }
 
@@ -1525,13 +1540,13 @@ mod linux_os_isolation {
         writer: &mut impl Write,
         config: &SandboxConfig,
         wasm_bytes: &[u8],
-        snapshot_json: &[u8],
+        tick_input_bytes: &[u8],
     ) -> Result<(), SandboxError> {
         writer.write_all(&PROTOCOL_MAGIC.to_le_bytes())?;
         writer.write_all(&PROTOCOL_VERSION.to_le_bytes())?;
         write_config(writer, config)?;
         write_bytes(writer, wasm_bytes)?;
-        write_bytes(writer, snapshot_json)?;
+        write_bytes(writer, tick_input_bytes)?;
         Ok(())
     }
 
@@ -1549,11 +1564,11 @@ mod linux_os_isolation {
         }
         let config = read_config(&mut cursor)?;
         let wasm_bytes = cursor.bytes()?;
-        let snapshot_json = cursor.bytes()?;
+        let tick_input_bytes = cursor.bytes()?;
         if cursor.remaining() != 0 {
             return Err(SandboxError::OsIsolationProtocol("trailing bytes".into()));
         }
-        Ok((config, wasm_bytes, snapshot_json))
+        Ok((config, wasm_bytes, tick_input_bytes))
     }
 
     fn write_config(writer: &mut impl Write, config: &SandboxConfig) -> Result<(), SandboxError> {
@@ -1562,7 +1577,7 @@ mod linux_os_isolation {
         writer.write_all(&config.max_host_calls_per_tick.to_le_bytes())?;
         writer.write_all(&config.max_path_find_per_tick.to_le_bytes())?;
         writer.write_all(&config.max_objects_in_range_per_tick.to_le_bytes())?;
-        writer.write_all(&(config.max_output_json_bytes as u64).to_le_bytes())?;
+        writer.write_all(&(config.max_output_bytes as u64).to_le_bytes())?;
         writer.write_all(&config.tick_timeout_ms.to_le_bytes())?;
         writer.write_all(&[config.wasm_simd as u8])?;
         writer.write_all(&[config.os_isolation.seccomp as u8])?;
@@ -1581,7 +1596,7 @@ mod linux_os_isolation {
             max_host_calls_per_tick: cursor.u32()?,
             max_path_find_per_tick: cursor.u32()?,
             max_objects_in_range_per_tick: cursor.u32()?,
-            max_output_json_bytes: cursor.u64()? as usize,
+            max_output_bytes: cursor.u64()? as usize,
             tick_timeout_ms: cursor.u64()?,
             wasm_simd: cursor.bool()?,
             isolation: IsolationMode::InProcess,
@@ -1608,8 +1623,7 @@ mod linux_os_isolation {
         stdout.write_all(&output.host_call_budget.world_rules_calls.to_le_bytes())?;
         stdout.write_all(&output.host_call_budget.random_calls.to_le_bytes())?;
         stdout.write_all(&output.host_call_budget.fuel_remaining_calls.to_le_bytes())?;
-        write_bytes(&mut stdout, &output.command_json)?;
-        write_bytes(&mut stdout, &output.messages)?;
+        write_bytes(&mut stdout, &output.tick_result_bytes)?;
         Ok(())
     }
 
@@ -1647,15 +1661,14 @@ mod linux_os_isolation {
                     random_calls: cursor.u32()?,
                     fuel_remaining_calls: cursor.u32()?,
                 };
-                let command_json = cursor.bytes()?;
-                let messages = if cursor.remaining() == 0 {
-                    Vec::new()
-                } else {
-                    cursor.bytes()?
-                };
+                let tick_result_bytes = cursor.bytes()?;
+                if cursor.remaining() != 0 {
+                    return Err(SandboxError::OsIsolationProtocol(
+                        "trailing response bytes".into(),
+                    ));
+                }
                 Ok(ChildResponse::Ok(TickOutput {
-                    command_json,
-                    messages,
+                    tick_result_bytes,
                     host_call_budget,
                 }))
             }
@@ -2091,6 +2104,14 @@ mod linux_os_isolation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swarm_engine_api::abi::{
+        FuelBudgetHints, MessageInboxCursor, SnapshotActorContext, SnapshotOmittedBucket,
+        SnapshotOmittedCategories, TickResult, WorldConfigView, WorldId, encode_tick_input,
+        encode_tick_result, encode_visible_snapshot,
+    };
+
+    #[cfg(all(feature = "os-isolation", target_os = "linux"))]
+    static OS_ISOLATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn wasm(wat: &str) -> Vec<u8> {
         wat::parse_str(wat).expect("valid wat")
@@ -2100,7 +2121,7 @@ mod tests {
         wasm(
             r#"
             (module
-              (memory (export "memory") 1 1024)
+              (memory (export "memory") 5 1024)
               (global $heap (mut i32) (i32.const 4096))
               (func (export "alloc") (param $len i32) (result i32)
                 (local $ptr i32)
@@ -2111,11 +2132,15 @@ mod tests {
                     (i32.const -4)))
                 (local.get $ptr))
               (func (export "free") (param i32) (param i32))
-              (data (i32.const 1024) "[]")
-              (func (export "tick") (param $snapshot_ptr i32) (param $snapshot_len i32) (param $result_ptr i32) (result i32)
-                (i32.store (local.get $result_ptr) (i32.const 1024))
-                (i32.store offset=4 (local.get $result_ptr) (i32.const 2))
-                (i32.const 0)))
+              (func (export "tick") (param i32 i32) (param $output_ptr i32) (param i32) (result i32)
+                (i32.store (local.get $output_ptr) (i32.const 2))
+                (i32.store offset=4 (local.get $output_ptr) (i32.const 4))
+                (i32.store offset=8 (local.get $output_ptr) (i32.const 1))
+                (i32.store offset=12 (local.get $output_ptr) (i32.const 2))
+                (i32.store offset=16 (local.get $output_ptr) (i32.const 8))
+                (i32.store offset=20 (local.get $output_ptr) (i32.const 0))
+                (i32.store offset=24 (local.get $output_ptr) (i32.const 0))
+                (i32.const 28)))
             "#,
         )
     }
@@ -2129,9 +2154,67 @@ mod tests {
                 (i32x4.extract_lane 0 (v128.const i32x4 1 2 3 4)))
               (func (export "alloc") (param i32) (result i32) (i32.const 0))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+              (func (export "tick") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
             "#,
         )
+    }
+
+    fn visible_snapshot(tick: u64) -> VisibleSnapshot {
+        VisibleSnapshot {
+            tick,
+            player_id: 7,
+            world_seed: 42,
+            actor_id: 99,
+            actor_context: SnapshotActorContext {
+                active_drones: Vec::new(),
+                primary_drone: None,
+            },
+            truncated: false,
+            degraded: false,
+            over_budget: false,
+            omitted_categories: SnapshotOmittedCategories {
+                entities: SnapshotOmittedBucket::Zero,
+                resources: SnapshotOmittedBucket::Zero,
+                events: SnapshotOmittedBucket::Zero,
+                terrain: SnapshotOmittedBucket::Zero,
+                messages: SnapshotOmittedBucket::Zero,
+            },
+            terrain: Vec::new(),
+            entities: Vec::new(),
+            resources: Vec::new(),
+            events: Vec::new(),
+            messages: Vec::new(),
+            omitted_messages: SnapshotOmittedBucket::Zero,
+        }
+    }
+
+    fn canonical_tick_input(tick: u64) -> Vec<u8> {
+        let snapshot = visible_snapshot(tick);
+        encode_tick_input(&TickInput {
+            tick,
+            player_id: snapshot.player_id,
+            world_id: WorldId::from_raw(1),
+            visible_snapshot: encode_visible_snapshot(&snapshot).unwrap(),
+            world_config_view: WorldConfigView {
+                config_hash: [0; 32],
+                payload: Vec::new(),
+            },
+            fuel_budget_hints: FuelBudgetHints {
+                fuel_remaining: MAX_FUEL,
+                host_calls_remaining: DEFAULT_HOST_CALLS_PER_TICK,
+                output_bytes_remaining: MAX_OUTPUT_BYTES as u32,
+            },
+            message_inbox_cursor: MessageInboxCursor { next_message_id: 0 },
+        })
+        .unwrap()
+    }
+
+    fn empty_tick_result() -> Vec<u8> {
+        encode_tick_result(&TickResult {
+            commands: Vec::new(),
+            messages: Vec::new(),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -2177,33 +2260,57 @@ mod tests {
     }
 
     #[test]
-    fn host_rng_requires_seed_tick_and_actor_fields() {
-        let complete = serde_json::json!({
-            "world_seed": 42,
-            "tick": 7,
-            "actor_id": 99
-        });
-        assert_eq!(derive_random_bytes(&complete, 1, 16).unwrap().len(), 16);
+    fn host_rng_uses_typed_snapshot_fields_deterministically() {
+        let snapshot = visible_snapshot(7);
+        let first = derive_random_bytes(&snapshot, 1, 16).unwrap();
+        assert_eq!(first, derive_random_bytes(&snapshot, 1, 16).unwrap());
+        assert_ne!(first, derive_random_bytes(&snapshot, 2, 16).unwrap());
+    }
 
-        for (field, snapshot) in [
-            (
-                "world_seed",
-                serde_json::json!({ "tick": 7, "actor_id": 99 }),
-            ),
-            (
-                "tick",
-                serde_json::json!({ "world_seed": 42, "actor_id": 99 }),
-            ),
-            (
-                "actor_id",
-                serde_json::json!({ "world_seed": 42, "tick": 7 }),
-            ),
-        ] {
-            assert!(matches!(
-                derive_random_bytes(&snapshot, 1, 16),
-                Err(SandboxError::MissingHostRandomField(missing)) if missing == field
-            ));
-        }
+    #[test]
+    fn host_result_golden_bytes_match_engine_api_codec() {
+        let bytes = encode_host_result(&HostResult::success(HostTerrainResponse {
+            room_id: 7,
+            terrain: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                1, 0, // terrain tag
+                0, 0, 0, 0, // success code
+                8, 0, 0, 0, // payload length
+                7, 0, 0, 0, // room id
+                0, 0, 0, 0, // terrain length
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_json_tick_input_without_parsing_inner_state() {
+        let runtime = SandboxRuntime::default();
+        let module = runtime.compile(&valid_echo_module()).unwrap();
+        assert!(matches!(
+            runtime.execute_tick(&module, br#"{"tick":1}"#),
+            Err(SandboxError::InvalidTickInputAbi)
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_three_argument_tick_export() {
+        let bytes = wasm(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 0))
+              (func (export "free") (param i32) (param i32))
+              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+            "#,
+        );
+        assert!(matches!(
+            SandboxRuntime::default().compile(&bytes),
+            Err(SandboxError::WrongExportType { name: "tick", .. })
+        ));
     }
 
     #[test]
@@ -2259,7 +2366,7 @@ mod tests {
               (memory (export "memory") 1)
               (func (export "alloc") (param i32) (result i32) (i32.const 0))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+              (func (export "tick") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
             "#,
         );
         assert!(matches!(
@@ -2272,8 +2379,10 @@ mod tests {
     fn executes_deferred_tick_and_reads_output() {
         let runtime = SandboxRuntime::default();
         let module = runtime.compile(&valid_echo_module()).unwrap();
-        let output = runtime.execute_tick(&module, br#"{"tick":1}"#).unwrap();
-        assert_eq!(output.command_json, b"[]");
+        let output = runtime
+            .execute_tick(&module, &canonical_tick_input(1))
+            .unwrap();
+        assert_eq!(output.tick_result_bytes, empty_tick_result());
         assert_eq!(output.host_call_budget, HostCallBudget::default());
     }
 
@@ -2374,8 +2483,10 @@ mod tests {
         let mut cache = CompiledModuleCache::new();
         let module = runtime.compile_cached(&mut cache, &wasm).unwrap();
 
-        let output = runtime.execute_tick(&module, br#"{"tick":7}"#).unwrap();
-        assert_eq!(output.command_json, b"[]");
+        let output = runtime
+            .execute_tick(&module, &canonical_tick_input(7))
+            .unwrap();
+        assert_eq!(output.tick_result_bytes, empty_tick_result());
         assert_eq!(output.host_call_budget, HostCallBudget::default());
     }
 
@@ -2395,16 +2506,14 @@ mod tests {
                     (i32.const -4)))
                 (local.get $ptr))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32)
-                (i32.store (local.get 2) (i32.const 4096))
-                (i32.store offset=4 (local.get 2) (i32.const 262145))
-                (i32.const 0)))
+              (func (export "tick") (param i32 i32 i32 i32) (result i32)
+                (i32.const 262145)))
             "#,
         );
         let runtime = SandboxRuntime::default();
         let module = runtime.compile(&bytes).unwrap();
         assert!(matches!(
-            runtime.execute_tick(&module, b"{}"),
+            runtime.execute_tick(&module, &canonical_tick_input(1)),
             Err(SandboxError::OutputTooLarge { actual: 262145 })
         ));
     }
@@ -2417,13 +2526,13 @@ mod tests {
               (memory (export "memory") 1 1024)
               (func (export "alloc") (param i32) (result i32) (i32.const 65532))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+              (func (export "tick") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
             "#,
         );
         let runtime = SandboxRuntime::default();
         let module = runtime.compile(&bytes).unwrap();
         assert!(matches!(
-            runtime.execute_tick(&module, b"{}"),
+            runtime.execute_tick(&module, &canonical_tick_input(1)),
             Err(SandboxError::MemoryOutOfBounds { .. })
         ));
     }
@@ -2434,7 +2543,7 @@ mod tests {
             r#"
             (module
               (import "env" "host_path_find" (func $host_path_find (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1 1024)
+              (memory (export "memory") 5 1024)
               (global $heap (mut i32) (i32.const 4096))
               (func (export "alloc") (param $len i32) (result i32)
                 (local $ptr i32)
@@ -2445,13 +2554,17 @@ mod tests {
                     (i32.const -4)))
                 (local.get $ptr))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32)
+              (func (export "tick") (param i32 i32) (param $output_ptr i32) (param i32) (result i32)
                 (drop (call $host_path_find (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 2048) (i32.const 8)))
                 (drop (call $host_path_find (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 2048) (i32.const 8)))
-                (i32.store (local.get 2) (i32.const 1024))
-                (i32.store offset=4 (local.get 2) (i32.const 2))
-                (i32.const 0))
-              (data (i32.const 1024) "[]"))
+                (i32.store (local.get $output_ptr) (i32.const 2))
+                (i32.store offset=4 (local.get $output_ptr) (i32.const 4))
+                (i32.store offset=8 (local.get $output_ptr) (i32.const 1))
+                (i32.store offset=12 (local.get $output_ptr) (i32.const 2))
+                (i32.store offset=16 (local.get $output_ptr) (i32.const 8))
+                (i32.store offset=20 (local.get $output_ptr) (i32.const 0))
+                (i32.store offset=24 (local.get $output_ptr) (i32.const 0))
+                (i32.const 28)))
             "#,
         );
         let runtime = SandboxRuntime::new(SandboxConfig {
@@ -2460,7 +2573,9 @@ mod tests {
         })
         .unwrap();
         let module = runtime.compile(&bytes).unwrap();
-        let output = runtime.execute_tick(&module, b"{}").unwrap();
+        let output = runtime
+            .execute_tick(&module, &canonical_tick_input(1))
+            .unwrap();
         assert_eq!(output.host_call_budget.path_find_calls, 2);
     }
 
@@ -2473,7 +2588,7 @@ mod tests {
               (import "env" "host_get_world_rules" (func $host_get_world_rules (param i32 i32 i32 i32) (result i32)))
               (import "env" "host_get_random" (func $host_get_random (param i64 i32 i32) (result i32)))
               (import "env" "host_get_fuel_remaining" (func $host_get_fuel_remaining (result i64)))
-              (memory (export "memory") 1 1024)
+              (memory (export "memory") 5 1024)
               (global $heap (mut i32) (i32.const 4096))
               (func (export "alloc") (param $len i32) (result i32)
                 (local $ptr i32)
@@ -2484,33 +2599,34 @@ mod tests {
                     (i32.const -4)))
                 (local.get $ptr))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32)
+              (func (export "tick") (param i32 i32) (param $output_ptr i32) (param i32) (result i32)
                 (local $terrain_len i32)
                 (local $rules_len i32)
                 (local $random_len i32)
                 (local $fuel i64)
                 (local.set $terrain_len (call $host_get_terrain (i32.const 7) (i32.const 2048) (i32.const 512)))
                 (local.set $rules_len (call $host_get_world_rules (i32.const 0) (i32.const 0) (i32.const 2560) (i32.const 512)))
-                (local.set $random_len (call $host_get_random (i64.const 42) (i32.const 3072) (i32.const 32)))
+                (local.set $random_len (call $host_get_random (i64.const 42) (i32.const 3072) (i32.const 512)))
                 (local.set $fuel (call $host_get_fuel_remaining))
                 (if
                   (i32.or
                     (i32.or (i32.lt_s (local.get $terrain_len) (i32.const 1)) (i32.lt_s (local.get $rules_len) (i32.const 1)))
-                    (i32.or (i32.ne (local.get $random_len) (i32.const 32)) (i64.eqz (local.get $fuel))))
+                    (i32.or (i32.lt_s (local.get $random_len) (i32.const 1)) (i64.eqz (local.get $fuel))))
                   (then (return (i32.const 9))))
-                (i32.store (local.get 2) (i32.const 1024))
-                (i32.store offset=4 (local.get 2) (i32.const 2))
-                (i32.const 0))
-              (data (i32.const 1024) "[]"))
+                (i32.store (local.get $output_ptr) (i32.const 2))
+                (i32.store offset=4 (local.get $output_ptr) (i32.const 4))
+                (i32.store offset=8 (local.get $output_ptr) (i32.const 1))
+                (i32.store offset=12 (local.get $output_ptr) (i32.const 2))
+                (i32.store offset=16 (local.get $output_ptr) (i32.const 8))
+                (i32.store offset=20 (local.get $output_ptr) (i32.const 0))
+                (i32.store offset=24 (local.get $output_ptr) (i32.const 0))
+                (i32.const 28)))
             "#,
         );
         let runtime = SandboxRuntime::default();
         let module = runtime.compile(&bytes).unwrap();
         let output = runtime
-            .execute_tick(
-                &module,
-                br#"{"world_seed":123,"tick":9,"actor_id":5,"room":{"terrain":[".."]}}"#,
-            )
+            .execute_tick(&module, &canonical_tick_input(9))
             .unwrap();
         assert_eq!(output.host_call_budget.total_calls, 4);
         assert_eq!(output.host_call_budget.world_rules_calls, 1);
@@ -2527,7 +2643,7 @@ mod tests {
               (memory (export "memory") 1)
               (func (export "alloc") (param i32) (result i32) (i32.const 0))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+              (func (export "tick") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
             "#,
         );
         assert!(matches!(
@@ -2544,7 +2660,7 @@ mod tests {
               (memory (export "memory") 1 1024)
               (func (export "alloc") (param i32) (result i32) (i32.const 1024))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32)
+              (func (export "tick") (param i32 i32 i32 i32) (result i32)
                 (loop $again br $again)
                 (i32.const 0)))
             "#,
@@ -2555,7 +2671,11 @@ mod tests {
         })
         .unwrap();
         let module = runtime.compile(&bytes).unwrap();
-        assert!(runtime.execute_tick(&module, b"{}").is_err());
+        assert!(
+            runtime
+                .execute_tick(&module, &canonical_tick_input(1))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2592,43 +2712,56 @@ mod tests {
     #[test]
     #[cfg(all(feature = "os-isolation", target_os = "linux"))]
     fn os_process_isolation_executes_tick_in_child_process() {
+        let _guard = OS_ISOLATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let runtime = SandboxRuntime::new(SandboxConfig {
             isolation: IsolationMode::OsProcess,
+            os_isolation: OsIsolationPolicy::development(),
             ..SandboxConfig::default()
         })
         .unwrap();
         let module = runtime.compile(&valid_echo_module()).unwrap();
-        let output = runtime.execute_tick(&module, br#"{"tick":1}"#).unwrap();
-        assert_eq!(output.command_json, b"[]");
+        let output = runtime
+            .execute_tick(&module, &canonical_tick_input(1))
+            .unwrap();
+        assert_eq!(output.tick_result_bytes, empty_tick_result());
         assert_eq!(output.host_call_budget, HostCallBudget::default());
     }
 
     #[test]
     #[cfg(all(feature = "os-isolation", target_os = "linux"))]
     fn os_process_isolation_kills_timed_out_process_group() {
+        let _guard = OS_ISOLATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = wasm(
             r#"
             (module
-              (memory (export "memory") 1 1024)
+              (memory (export "memory") 5 1024)
               (func (export "alloc") (param i32) (result i32) (i32.const 1024))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32)
+              (func (export "tick") (param i32 i32 i32 i32) (result i32)
                 (loop $again br $again)
                 (i32.const 0)))
             "#,
         );
         let runtime = SandboxRuntime::new(SandboxConfig {
             isolation: IsolationMode::OsProcess,
+            os_isolation: OsIsolationPolicy::development(),
             max_fuel: u64::MAX,
             tick_timeout_ms: 50,
             ..SandboxConfig::default()
         })
         .unwrap();
         let module = runtime.compile(&bytes).unwrap();
-        assert!(matches!(
-            runtime.execute_tick(&module, b"{}"),
-            Err(SandboxError::OsIsolationTimedOut { timeout_ms: 50 })
-        ));
+        let error = runtime
+            .execute_tick(&module, &canonical_tick_input(1))
+            .unwrap_err();
+        assert!(
+            matches!(error, SandboxError::OsIsolationTimedOut { timeout_ms: 50 }),
+            "unexpected OS-isolation timeout result: {error:?}"
+        );
     }
 
     #[test]
@@ -2641,7 +2774,7 @@ mod tests {
         .unwrap();
         let module = runtime.compile(&valid_echo_module()).unwrap();
         assert!(matches!(
-            runtime.execute_tick(&module, b"{}"),
+            runtime.execute_tick(&module, &canonical_tick_input(1)),
             Err(SandboxError::OsIsolationUnavailable)
         ));
     }
