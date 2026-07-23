@@ -14,6 +14,7 @@ libc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+swarm-engine-api = { git = "https://github.com/game-swarm/engine-api.git", rev = "d29a8f36b6d54ce6dfb5fb81985731110f7c48c8", version = "=0.1.0" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
