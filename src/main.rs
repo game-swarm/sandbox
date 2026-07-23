@@ -20,7 +20,7 @@ use std::os::unix::fs::MetadataExt;
 use futures_util::StreamExt;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::Sha256;
 use swarm_wasm_sandbox::{
     CompiledModule, CompiledModuleCache, HostCallBudget, IsolationMode, OsIsolationPolicy,
@@ -35,9 +35,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const DEPLOY_SCHEMA: &str = "swarm.sandbox.deploy.v1";
-const TICK_SCHEMA: &str = "swarm.sandbox.tick.v1";
-const MODULE_FETCH_SCHEMA: &str = "swarm.sandbox.module-fetch.v1";
+const DEPLOY_SCHEMA: &str = "swarm.sandbox.deploy.v2";
+const TICK_SCHEMA: &str = "swarm.sandbox.tick.v2";
+const MODULE_FETCH_SCHEMA: &str = "swarm.sandbox.module-fetch.v2";
 const AUTH_FRESHNESS_MS: u64 = 60_000;
 const AUTH_FUTURE_SKEW_MS: u64 = 5_000;
 const DEFAULT_NATS_CONNECT_RETRY_MS: u64 = 1_000;
@@ -74,7 +74,7 @@ struct SandboxTickRequest {
     player_id: String,
     room_id: String,
     module_hash: [u8; 32],
-    snapshot_json: String,
+    tick_input_bytes: Vec<u8>,
     fuel_budget: u64,
     collect_timeout_ms: u64,
     collect_deadline_ms: u64,
@@ -84,7 +84,8 @@ struct SandboxTickRequest {
 struct SandboxTickReply {
     tick: u64,
     player_id: String,
-    commands: Vec<Value>,
+    tick_result_bytes: Vec<u8>,
+    errors: Vec<String>,
     metrics: SandboxExecutionMetrics,
     status: String,
 }
@@ -1151,7 +1152,8 @@ async fn handle_ticks(
                 Err(error) => SandboxTickReply {
                     tick: request.payload.tick,
                     player_id: request.payload.player_id,
-                    commands: Vec::new(),
+                    tick_result_bytes: Vec::new(),
+                    errors: vec!["ExecutionFailed".to_string()],
                     metrics: SandboxExecutionMetrics::default(),
                     status: format!("Trap({error})"),
                 },
@@ -1159,7 +1161,8 @@ async fn handle_ticks(
             Err(error) => SandboxTickReply {
                 tick: 0,
                 player_id: String::new(),
-                commands: Vec::new(),
+                tick_result_bytes: Vec::new(),
+                errors: vec!["ExecutionFailed".to_string()],
                 metrics: SandboxExecutionMetrics::default(),
                 status: format!("Trap({error})"),
             },
@@ -1218,7 +1221,7 @@ async fn execute_request(
                 let status = if remaining_collect_ms(request.collect_deadline_ms).is_err() {
                     "Timeout"
                 } else {
-                    "ModuleNotFound"
+                    "ArtifactUnavailable"
                 };
                 return tick_reply(
                     request,
@@ -1269,9 +1272,9 @@ async fn execute_request(
             );
         }
     };
-    let snapshot_json = request.snapshot_json.clone().into_bytes();
+    let tick_input_bytes = request.tick_input_bytes.clone();
     let execution =
-        tokio::task::spawn_blocking(move || runtime.execute_tick(&compiled, &snapshot_json));
+        tokio::task::spawn_blocking(move || runtime.execute_tick(&compiled, &tick_input_bytes));
     let output = match time::timeout(Duration::from_millis(timeout_ms), execution).await {
         Ok(Ok(Ok(output))) => output,
         Ok(Ok(Err(error))) => {
@@ -1301,10 +1304,9 @@ async fn execute_request(
         }
     };
 
-    let commands = serde_json::from_slice::<Vec<Value>>(&output.command_json).unwrap_or_default();
     tick_reply(
         request,
-        commands,
+        output.tick_result_bytes,
         metrics(started_at, output.host_call_budget),
         "Ok",
     )
@@ -1502,17 +1504,31 @@ async fn heartbeat(
 
 fn tick_reply(
     request: SandboxTickRequest,
-    commands: Vec<Value>,
+    tick_result_bytes: Vec<u8>,
     metrics: SandboxExecutionMetrics,
     status: impl Into<String>,
 ) -> SandboxTickReply {
+    let status = status.into();
+    let errors = deterministic_tick_errors(&status);
     SandboxTickReply {
         tick: request.tick,
         player_id: request.player_id,
-        commands,
+        tick_result_bytes,
+        errors,
         metrics,
-        status: status.into(),
+        status,
     }
+}
+
+fn deterministic_tick_errors(status: &str) -> Vec<String> {
+    let error = match status {
+        "Ok" | "Timeout" => return Vec::new(),
+        "ArtifactUnavailable" => "ArtifactUnavailable",
+        "FuelExhausted" => "FuelExhausted",
+        status if status.starts_with("Trap(") => "ExecutionFailed",
+        _ => "ExecutionFailed",
+    };
+    vec![error.to_string()]
 }
 
 fn metrics(started_at: Instant, host_call_budget: HostCallBudget) -> SandboxExecutionMetrics {
@@ -1733,6 +1749,24 @@ mod tests {
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+    #[test]
+    fn tick_reply_errors_are_deterministic_and_timeouts_stay_empty() {
+        assert!(deterministic_tick_errors("Ok").is_empty());
+        assert!(deterministic_tick_errors("Timeout").is_empty());
+        assert_eq!(
+            deterministic_tick_errors("ArtifactUnavailable"),
+            vec!["ArtifactUnavailable"]
+        );
+        assert_eq!(
+            deterministic_tick_errors("FuelExhausted"),
+            vec!["FuelExhausted"]
+        );
+        assert_eq!(
+            deterministic_tick_errors("Trap(machine-specific detail)"),
+            vec!["ExecutionFailed"]
+        );
+    }
+
     fn deploy_payload() -> DeployRequest {
         let module_bytes = wat::parse_str(
             r#"
@@ -1740,7 +1774,7 @@ mod tests {
               (memory (export "memory") 1)
               (func (export "alloc") (param i32) (result i32) (i32.const 0))
               (func (export "free") (param i32) (param i32))
-              (func (export "tick") (param i32 i32 i32) (result i32) (i32.const 0)))
+              (func (export "tick") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
             "#,
         )
         .expect("valid wat");
@@ -1759,7 +1793,7 @@ mod tests {
             player_id: "player-1".to_string(),
             room_id: "room-1".to_string(),
             module_hash: [9; 32],
-            snapshot_json: "{}".to_string(),
+            tick_input_bytes: b"tick-input".to_vec(),
             fuel_budget: 100,
             collect_timeout_ms: 250,
             collect_deadline_ms: current_time_ms().unwrap().saturating_add(5_000),
@@ -2410,7 +2444,8 @@ mod tests {
         let reply = SandboxTickReply {
             tick: 7,
             player_id: "player-1".to_string(),
-            commands: Vec::new(),
+            tick_result_bytes: Vec::new(),
+            errors: Vec::new(),
             metrics: SandboxExecutionMetrics::default(),
             status: "Ok".to_string(),
         };
@@ -2752,9 +2787,9 @@ mod tests {
         let payload = tick_payload();
         let bytes = serde_json::to_vec(&payload).unwrap();
         let mut expected = concat!(
-            r#"{"schema":"swarm.sandbox.tick.v1","tick":7,"player_id":"player-1","#,
+                r#"{"schema":"swarm.sandbox.tick.v2","tick":7,"player_id":"player-1","#,
             r#""room_id":"room-1","module_hash":[9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9],"#,
-            r#""snapshot_json":"{}","fuel_budget":100,"collect_timeout_ms":250,"collect_deadline_ms":"#,
+            r#""tick_input_bytes":[116,105,99,107,45,105,110,112,117,116],"fuel_budget":100,"collect_timeout_ms":250,"collect_deadline_ms":"#,
         )
         .to_string();
         expected.push_str(&payload.collect_deadline_ms.to_string());
@@ -2818,7 +2853,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             concat!(
-                r#"{"schema":"swarm.sandbox.deploy.v1","module_hash":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
+                r#"{"schema":"swarm.sandbox.deploy.v2","module_hash":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
                 r#""module_bytes":[0,97,115,109],"validation_policy_version":"policy-v1"}"#
             )
         );
